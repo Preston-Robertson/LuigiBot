@@ -17,6 +17,7 @@ from discord import interactions
 
 # For Data 
 import pandas as pd
+print(Test)
 
 
 
