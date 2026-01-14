@@ -158,42 +158,46 @@ async def on_reaction_add(reaction, user):
         to_do_list_df.to_pickle(path_for_to_do_list)
 
 
-        # Creating the Complete Message. 
+        # Creating the Complete Message.
+        # 
+        try: 
+            to_do_list_df = pd.read_pickle(path_for_to_do_list)
+            try:
+                    filtered_df = to_do_list_df[to_do_list_df["TASK"] == task_name]
+            except Exception as e: 
+                await to_do_list_channel.send(f"Something went wrong: {e}")
 
-        to_do_list_df = pd.read_pickle(path_for_to_do_list)
-        try:
-                filtered_df = to_do_list_df[to_do_list_df["TASK"] == task_name]
-        except Exception as e: 
-            await to_do_list_channel.send(f"Something went wrong: {e}")
+            to_do_list_df = pd.read_pickle(path_for_to_do_list)
+            task_df = to_do_list_df[to_do_list_df["TASK"] == task_name]
 
-        to_do_list_df = pd.read_pickle(path_for_to_do_list)
-        task_df = to_do_list_df[to_do_list_df["TASK"] == task_name]
-
-        for _, row in task_df.astype(str).iterrows():
-            task_name = row["TASK"]
-            embed = discord.Embed(title=task_name, color=0x00FF00)
-            priority = row["PRIORITY"]
-            task_creation = row["TASK CREATION"]
-            catagory = row["CATAGORY"]
-            group = row["GROUP"]   
-            subgroup = row["SUB-GROUP"]
-            starttime = row["START TIME"]
-            estimated_time = row["ESTIMATED TIME"]
-            logged_hours = row["LOGGED HOURS"]
-            status = row["STATUS"]
-            if row["DUE DATE"] != "NaT":
-                due = row["DUE DATE"]
-            else:
-                due = "No due date"
-            link = row["RELEVANT LINK"]
-            link_md = f"[LINK]({link})" if link and link not in ("None", "nan") else "No link"
-            value = f"""Priority: {priority}\nDue: {due}\nSubgroup: {subgroup}\nStart Time: {starttime}\nEstimated Time: {estimated_time}\nLogged Hours: {logged_hours}\nTask Created: {task_creation}\n{link_md}\n"""
-            embed.add_field(name=status,value=value, inline=False)
+            for _, row in task_df.astype(str).iterrows():
+                task_name = row["TASK"]
+                embed = discord.Embed(title=task_name, color=0x00FF00)
+                priority = row["PRIORITY"]
+                task_creation = row["TASK CREATION"]
+                catagory = row["CATAGORY"]
+                group = row["GROUP"]   
+                subgroup = row["SUB-GROUP"]
+                starttime = row["START TIME"]
+                estimated_time = row["ESTIMATED TIME"]
+                logged_hours = row["LOGGED HOURS"]
+                status = row["STATUS"]
+                if row["DUE DATE"] != "NaT":
+                    due = row["DUE DATE"]
+                else:
+                    due = "No due date"
+                link = row["RELEVANT LINK"]
+                link_md = f"[LINK]({link})" if link and link not in ("None", "nan") else "No link"
+                value = f"""Priority: {priority}\nDue: {due}\nSubgroup: {subgroup}\nStart Time: {starttime}\nEstimated Time: {estimated_time}\nLogged Hours: {logged_hours}\nTask Created: {task_creation}\n{link_md}\n"""
+                embed.add_field(name=status,value=value, inline=False)
 
 
-        msg = await to_do_list_channel.send(embed=embed) 
+            msg = await to_do_list_channel.send(embed=embed) 
 
-        await to_do_list_channel.send(f"Updated '{task_name}' to 'Completed'")
+        except Exception as e:
+            await to_do_list_channel.send(f"Error sending completed task: '{task_name}': {e}")
+            await to_do_list_channel.send(f"Updated '{task_name}' to 'Completed'")
+            # No longer needed
 
         await reaction.message.delete()
 
@@ -255,7 +259,7 @@ async def to_do_list(ctx):
 
         count += 1
     
-    msg = await ctx.channel.send(embed=embed, delete_after=180)  # Delete after 3 minutes
+    msg = await ctx.channel.send(embed=embed, delete_after=60)  # Delete after 1 minute
 
     for i in range(min(count, len(number_emojis))):
         try:
