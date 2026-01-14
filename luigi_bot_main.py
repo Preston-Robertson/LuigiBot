@@ -89,11 +89,16 @@ async def on_reaction_add(reaction, user):
     luigi_channel = bot.get_channel(channel_id)
     #"{reaction.message.content}"
 
+    try: 
+        to_do_list_channel = bot.get_channel(config['Channel_ID_to_do'])
+    except:
+        to_do_list_channel = luigi_channel
+
     emoji = str(reaction.emoji)
 
     if str(reaction.emoji) in number_emojis:
         embed = discord.Embed(title="Task", color=0x00FF00)
-        await luigi_channel.send(f'{user.name} reacted with {reaction.emoji} to the To Do List.')
+        await to_do_list_channel.send(f'{user.name} reacted with {reaction.emoji} to the To Do List.')
 
         idx = number_emojis.index(emoji)
         to_do_list_df = pd.read_pickle(path_for_to_do_list)
@@ -122,7 +127,7 @@ async def on_reaction_add(reaction, user):
             embed.add_field(name=status,value=value, inline=False)
         
         
-        msg = await luigi_channel.send(embed=embed)
+        msg = await to_do_list_channel.send(embed=embed)
         await msg.add_reaction("✅")
         await msg.add_reaction("▶️")
         await msg.add_reaction("⏸️")
@@ -137,7 +142,7 @@ async def on_reaction_add(reaction, user):
         try:
                 filtered_df = to_do_list_df[to_do_list_df["TASK"] == task_name]
         except Exception as e: 
-            await luigi_channel.send(f"Something went wrong: {e}")
+            await to_do_list_channel.send(f"Something went wrong: {e}")
 
         to_do_list_df.loc[to_do_list_df["TASK"] == task_name, "COMPLTETED TIME"] = pd.to_datetime(datetime.datetime.now().isoformat(' ', 'seconds'))
         if filtered_df["LOGGED HOURS"][0] != None:
@@ -148,7 +153,7 @@ async def on_reaction_add(reaction, user):
 
         to_do_list_df.loc[to_do_list_df["TASK"] == task_name, "STATUS"] = "Completed"
         to_do_list_df.to_pickle(path_for_to_do_list)
-        await luigi_channel.send(f"Updated '{task_name}' to 'Completed'")
+        await to_do_list_channel.send(f"Updated '{task_name}' to 'Completed'")
         await reaction.message.delete()
 
 
@@ -162,7 +167,7 @@ async def on_reaction_add(reaction, user):
             to_do_list_df.loc[to_do_list_df["TASK"] == task_name, "START TIME"] = pd.to_datetime(datetime.datetime.now().isoformat(' ', 'seconds'))
         to_do_list_df.loc[to_do_list_df["TASK"] == task_name, "STATUS"] = "In Progress"
         to_do_list_df.to_pickle(path_for_to_do_list)
-        await luigi_channel.send(f"Updated '{task_name}' to 'In Progress'")
+        await to_do_list_channel.send(f"Updated '{task_name}' to 'In Progress'")
         await reaction.message.delete()
 
 
@@ -171,7 +176,7 @@ async def on_reaction_add(reaction, user):
         to_do_list_df = pd.read_pickle(path_for_to_do_list)
         to_do_list_df.loc[to_do_list_df["TASK"] == task_name, "STATUS"] = "Hiatus"
         to_do_list_df.to_pickle(path_for_to_do_list)
-        await luigi_channel.send(f"Updated '{task_name}' to 'Hiatus'")
+        await to_do_list_channel.send(f"Updated '{task_name}' to 'Hiatus'")
         await reaction.message.delete()
         # You can add further actions here, like assigning a role or sending a message
 
