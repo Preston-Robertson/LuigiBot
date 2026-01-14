@@ -3,7 +3,7 @@
 
 # Discord
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 # General
 import json
@@ -35,6 +35,7 @@ with open(f'config.json') as f:
 bot = commands.Bot(command_prefix="!L ", intents=discord.Intents.all())
 
 channel_id = config['Channel_ID']
+user_id = config['User_ID']
 
 path_for_to_do_list = "to_do_list\\to_do_list.pkl"
 
@@ -74,9 +75,6 @@ async def on_ready():
 async def hello(interaction: discord.Interaction):
     await interaction.response.send_message(f"Hey {interaction.user.mention}!")
 
-@bot.command()
-async def hello(ctx):
-    await ctx.send("Hello!")
 
 
 #%%
@@ -266,6 +264,47 @@ async def to_do_list(ctx):
             await msg.add_reaction(number_emojis[i])
         except Exception:
             pass
+
+
+
+#%% 
+
+# This command outputs the To-Do List Summary at 9:00am daily (Local time)
+
+
+@tasks.loop(hours=24)
+async def send_daily_message():
+    # Set your desired time (24-hour format)
+    to_do_list_channel = bot.get_channel(config['Channel_ID_to_do'])
+    target_time = datetime.time(hour=9, minute=0)  # 9:00 AM
+    
+    now = datetime.datetime.now().time()
+    
+    # Check if current time matches target time (within the minute)
+    if now.hour == target_time.hour and now.minute == target_time.minute:
+
+        to_do_list_df = pd.read_pickle(path_for_to_do_list)
+
+        filtered_df = to_do_list_df[to_do_list_df["STATUS"] != "Completed"]
+
+        # Build a single embed, each task as a field (renders well on mobile & desktop)
+        embed = discord.Embed(title="To Do List", color=0x00FF00)
+        count = 0
+        for _, row in filtered_df.loc[:, ["TASK", "PRIORITY", "STATUS", "DUE DATE", "RELEVANT LINK"]].sort_values(by=["PRIORITY", "DUE DATE"], ascending=[False, True]).astype(str).iterrows():
+            task_name = row["TASK"]
+            priority = row["PRIORITY"]
+            status = row["STATUS"]
+            if row["DUE DATE"] != "NaT":
+                due = row["DUE DATE"]
+            else:
+                due = "No due date"
+            link = row["RELEVANT LINK"]
+            link_md = f"[LINK]({link})" if link and link not in ("None", "nan") else "No link"
+            value = f"Priority: {priority}\nStatus: {status}\nDue: {due}\n{link_md}\n"
+            embed.add_field(name=f'{count+1}. {task_name}', value=value, inline=False)
+
+    await to_do_list_channel.send(f"<@{user_id}>, Daily To-Do List Summary:")    
+    await to_do_list_channel.send(embed=embed)
 
 
 
