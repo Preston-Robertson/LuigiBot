@@ -143,15 +143,15 @@ async def on_reaction_add(reaction, user):
         task_name = extract_task_name(reaction.message) 
         to_do_list_df = pd.read_pickle(path_for_to_do_list)
         try:
-                filtered_df = to_do_list_df[to_do_list_df["TASK"] == task_name]
+            filtered_df = to_do_list_df[to_do_list_df["TASK"] == task_name]
         except Exception as e: 
             await to_do_list_channel.send(f"Something went wrong: {e}")
 
         to_do_list_df.loc[to_do_list_df["TASK"] == task_name, "COMPLTETED TIME"] = pd.to_datetime(datetime.datetime.now().isoformat(' ', 'seconds'))
-        if filtered_df["LOGGED HOURS"][0] != None:
-            time_delta = filtered_df["COMPLETED TIME"] - filtered_df["START TIME"] + pd.Timedelta(hours = filtered_df["LOGGED HOURS"][0])
+        if to_do_list_df.loc[to_do_list_df["TASK"] == task_name, "LOGGED HOURS"][0] != None:
+            time_delta = to_do_list_df.loc[to_do_list_df["TASK"] == task_name,"COMPLETED TIME"] - to_do_list_df.loc[to_do_list_df["TASK"] == task_name,"START TIME"] + pd.Timedelta(hours = filtered_df["LOGGED HOURS"][0])
         else:
-            time_delta = filtered_df["COMPLETED TIME"] - filtered_df["START TIME"]
+            time_delta = to_do_list_df.loc[to_do_list_df["TASK"] == task_name,"COMPLETED TIME"] - to_do_list_df.loc[to_do_list_df["TASK"] == task_name,"START TIME"]
             to_do_list_df.loc[to_do_list_df["TASK"] == task_name, "LOGGED HOURS"] = time_delta
 
         to_do_list_df.loc[to_do_list_df["TASK"] == task_name, "STATUS"] = "Completed"
@@ -163,7 +163,7 @@ async def on_reaction_add(reaction, user):
         try: 
             to_do_list_df = pd.read_pickle(path_for_to_do_list)
             try:
-                    filtered_df = to_do_list_df[to_do_list_df["TASK"] == task_name]
+                filtered_df = to_do_list_df[to_do_list_df["TASK"] == task_name]
             except Exception as e: 
                 await to_do_list_channel.send(f"Something went wrong: {e}")
 
@@ -207,9 +207,10 @@ async def on_reaction_add(reaction, user):
     if emoji == "▶️":
         task_name = extract_task_name(reaction.message) 
         to_do_list_df = pd.read_pickle(path_for_to_do_list)
-        current_status = to_do_list_df.loc[to_do_list_df["TASK"] == task_name, "STATUS"].iloc[0]
-        if current_status == "Not Started":
-            to_do_list_df.loc[to_do_list_df["TASK"] == task_name, "START TIME"] = pd.to_datetime(datetime.datetime.now().isoformat(' ', 'seconds'))
+        #current_status = to_do_list_df.loc[to_do_list_df["TASK"] == task_name, "STATUS"].iloc[0]
+        #if current_status == "Not Started":
+        #Not needed
+        to_do_list_df.loc[to_do_list_df["TASK"] == task_name, "START TIME"] = pd.to_datetime(datetime.datetime.now().isoformat(' ', 'seconds'))
         to_do_list_df.loc[to_do_list_df["TASK"] == task_name, "STATUS"] = "In Progress"
         to_do_list_df.to_pickle(path_for_to_do_list)
         await to_do_list_channel.send(f"Updated '{task_name}' to 'In Progress'")
@@ -219,6 +220,14 @@ async def on_reaction_add(reaction, user):
     if emoji == "⏸️":
         task_name = extract_task_name(reaction.message) 
         to_do_list_df = pd.read_pickle(path_for_to_do_list)
+
+        if to_do_list_df.loc[to_do_list_df["TASK" == task_name, "STATUS"]] == 'In Progress':
+            # Then log hours
+            now = datetime.datetime.now()
+            start = to_do_list_df.loc[to_do_list_df["TASK"] == task_name, "START TIME"] 
+            logged_hours = (now - start).total_seconds() / 3600
+            to_do_list_df.loc[to_do_list_df["TASK" == task_name, "LOGGED HOURS"]] = to_do_list_df.loc[to_do_list_df["TASK" == task_name, "LOGGED HOURS"]] + logged_hours
+
         to_do_list_df.loc[to_do_list_df["TASK"] == task_name, "STATUS"] = "Hiatus"
         to_do_list_df.to_pickle(path_for_to_do_list)
         await to_do_list_channel.send(f"Updated '{task_name}' to 'Hiatus'")
@@ -276,6 +285,7 @@ async def to_do_list(ctx):
 # Define the specific time for the message (e.g., 9:45 AM UTC)
 # Use UTC or manage timezones carefully
 daily_message_time = datetime.time(hour=0, minute=45, second=0)
+weekly_completion_message_time = datetime.time(hour=1, minute=0, second=0)
 
 
 @tasks.loop(time = daily_message_time)
@@ -284,7 +294,14 @@ async def send_daily_message():
     to_do_list_channel = bot.get_channel(config['Channel_ID_to_do'])
     #target_time = datetime.time(hour=9, minute=0)  # 9:00 AM
     
-    #now = datetime.datetime.now().time()
+    now = datetime.datetime.now().time()
+    then = now.datetime.timedelta(days=1)
+    then.replace(hour=0, minute= 45)
+    wait_time = (then-now).total_seconds
+
+    await asyncio.sleep(wait_time)
+
+    
     
     # Check if current time matches target time (within the minute)
     if to_do_list_channel:
@@ -311,6 +328,27 @@ async def send_daily_message():
 
     await to_do_list_channel.send(f"<@{user_id}>, Daily To-Do List Summary:")    
     await to_do_list_channel.send(embed=embed)
+
+
+
+#%% 
+
+
+weekly_completion_message_time = datetime.time(hour=1, minute=0, second=0)
+
+@tasks.loop(time = weekly_completion_message_time)
+async def send_weekly_completion_message():
+    # Not sure if needed
+
+    to_do_list_channel = bot.get_channel(config['Channel_ID_to_do'])
+    
+    now = datetime.datetime.now().time()
+    then = now.datetime.timedelta(days=7)
+    then.replace(hour=1)
+    wait_time = (then-now).total_seconds
+
+    asyncio.sleep(wait_time)
+
 
 
 
@@ -386,7 +424,7 @@ async def create_task(ctx,
 
     try: 
         combine.to_pickle(path_for_to_do_list)
-        await ctx.send("Added")
+        await ctx.send("Added", delete_after = '60') # Deleting Added message after 60s 
     except Exception as e:
         await ctx.send(f"Something went wrong: {e}")
 
