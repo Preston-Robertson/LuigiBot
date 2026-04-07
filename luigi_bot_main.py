@@ -308,20 +308,22 @@ async def send_daily_message():
 
         recurring_pd = pd.read_pickle(path_for_recurring_tasks)
         to_do_list_df = pd.read_pickle(path_for_to_do_list)
-        filtered_df = to_do_list_df[to_do_list_df["STATUS"] == "Completed"]
+        active_df = to_do_list_df[to_do_list_df["STATUS"] != "Completed"]
+        completed_df = to_do_list_df[to_do_list_df["STATUS"] == "Completed"]
 
         for _, row in recurring_pd.iterrows():
             task_name = row["TASK"]
-            latest = filtered_df[filtered_df["TASK"] == task_name]["COMPLETED TIME"].max()
-            if datetime.datetime.now() - latest >= pd.Timedelta(days=row["RECURRING INTERVAL"]):
-                new_task = row.copy()
-                new_task["TASK CREATION"] = pd.to_datetime(datetime.datetime.now().isoformat(' ', 'seconds'))
-                new_task["STATUS"] = "Not Started"
-                new_task["START TIME"] = None
-                new_task["LOGGED HOURS"] = 0
-                new_task["COMPLETED"] = False
-                new_task["COMPLETED TIME"] = None
-                to_do_list_df = pd.concat([to_do_list_df, pd.DataFrame([new_task])])
+            if task_name not in active_df["TASK"].values:
+                latest = completed_df[completed_df["TASK"] == task_name]["COMPLETED TIME"].max()
+                if datetime.datetime.now() - latest >= pd.Timedelta(days=row["RECURRING INTERVAL"]):
+                    new_task = row.copy()
+                    new_task["TASK CREATION"] = pd.to_datetime(datetime.datetime.now().isoformat(' ', 'seconds'))
+                    new_task["STATUS"] = "Not Started"
+                    new_task["START TIME"] = None
+                    new_task["LOGGED HOURS"] = 0
+                    new_task["COMPLETED"] = False
+                    new_task["COMPLETED TIME"] = None
+                    to_do_list_df = pd.concat([to_do_list_df, pd.DataFrame([new_task])])
         to_do_list_df.to_pickle(path_for_to_do_list)
 
 
