@@ -77,7 +77,6 @@ async def on_ready():
 
 #%%
 # HELLO COMMAND
-
 @bot.tree.command(name = "hello", description= "Typical test command")
 async def hello(interaction: discord.Interaction):
     await interaction.response.send_message(f"Hey {interaction.user.mention}!")
@@ -137,7 +136,6 @@ async def on_reaction_add(reaction, user):
             value = f"""Priority: {priority}\nDue: {due}\nSubgroup: {subgroup}\nStart Time: {starttime}\nEstimated Time: {estimated_time}\nLogged Hours: {logged_hours}\nTask Created: {task_creation}\n{link_md}\n"""
             embed.add_field(name=status,value=value, inline=False)
         
-        
         msg = await to_do_list_channel.send(embed=embed)
         await msg.add_reaction("✅")
         await msg.add_reaction("▶️")
@@ -193,7 +191,7 @@ async def on_reaction_add(reaction, user):
                 group = row["GROUP"]   
                 subgroup = row["SUB-GROUP"]
                 starttime = row["START TIME"]
-                estimated_time = row["ESTIMATED TIME"]
+                #estimated_time = row["ESTIMATED TIME"]
                 logged_hours = row["LOGGED HOURS"]
                 status = row["STATUS"]
                 if row["DUE DATE"] != "NaT":
