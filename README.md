@@ -12,6 +12,9 @@ A personal Discord bot for managing your to-do list directly from a Discord chan
 - **Automatic time tracking** — logs hours when you start (▶️) and pause (⏸️) a task
 - **Recurring tasks** — define tasks that re-appear automatically after a set number of days
 - **Daily morning summary** — posts your active to-do list to a designated channel every day at 8:00 AM EST
+- **Daily discipline reminder** — posts an end-of-day prompt to log what was completed
+- **Separate discipline data store** — discipline tracker data is stored independently from the to-do list
+- **Discipline completion log** — completion events are stored separately for future analysis/visualization
 
 ---
 
@@ -26,6 +29,8 @@ LuigiBot/
 └── to_do_list/
     ├── to_do_list.pkl     # Persistent task storage
     └── recurring_tasks.pkl
+  └── discipline_list.pkl # Separate discipline tracker storage
+    └── discipline_completion_log.pkl # Daily completion event log for discipline tracker
 ```
 
 ---
@@ -67,6 +72,12 @@ Create a `config.json` file in the root directory with the following structure:
   "TOKEN": "your-discord-bot-token",
   "Channel_ID": 123456789012345678,
   "Channel_ID_to_do": 123456789012345678,
+  "Channel_ID_discipline": 123456789012345678,
+  "Discipline_List_Path": "to_do_list\\discipline_list.pkl",
+  "Discipline_Completion_Log_Path": "to_do_list\\discipline_completion_log.pkl",
+  "Discipline_Delete_After_Seconds": 7200,
+  "Discipline_Daily_Hour": 23,
+  "Discipline_Daily_Minute": 15,
   "User_ID": 123456789012345678
 }
 ```
@@ -76,6 +87,15 @@ Create a `config.json` file in the root directory with the following structure:
 | `TOKEN` | Your Discord bot token |
 | `Channel_ID` | The default channel the bot posts to |
 | `Channel_ID_to_do` | The channel used for to-do list messages |
+| `Channel_ID_discipline` | Discipline channel used by daily discipline reminder |
+| `Discipline_List_Path` | Path for the separate discipline tracker dataframe (default: `to_do_list\discipline_list.pkl`) |
+| `Discipline_Completion_Log_Path` | Path for discipline completion log dataframe (default: `to_do_list\discipline_completion_log.pkl`) |
+| `Discipline_Delete_After_Seconds` | Auto-delete timer for nightly discipline posts (default: 7200) |
+| `Discipline_Daily_Hour` / `Discipline_Daily_Minute` | Nightly discipline post time in ET (default: 23:15) |
+| `Discipline_List_Path` | Path for the separate discipline tracker dataframe |
+| `Discipline_Completion_Log_Path` | Path for discipline completion event logs |
+| `Discipline_Delete_After_Seconds` | Auto-delete timer for nightly discipline posts (default: 7200) |
+| `Discipline_Daily_Hour` / `Discipline_Daily_Minute` | Nightly discipline post time in ET (default: 23:15) |
 | `User_ID` | Your Discord user ID (for daily summary mentions) |
 
 **4. Initialize the data directory**
@@ -124,6 +144,24 @@ Creates a new task and adds it to your to-do list.
 
 ---
 
+### `/create_discipline_task` (or `!L create_discipline_task`)
+Creates a new item in the separate discipline tracker dataframe with only:
+
+- `task_name`
+- `catagory`
+- `frequency_per_week` (1 to 7)
+
+### `/discipline_list` (or `!L discipline_list`)
+Displays tracked discipline items from the separate discipline tracker.
+
+### `/log_discipline_completion` (or `!L log_discipline_completion`)
+Logs a completion event for data collection in `to_do_list/discipline_completion_log.pkl`.
+
+### `/today_completions` (or `!L today_completions`)
+Displays all discipline items you've logged as completed for a given date. If no date is provided, shows today.
+
+---
+
 ## Emoji Reactions
 
 When a task embed is displayed, you can react to control it:
@@ -140,6 +178,30 @@ When a task embed is displayed, you can react to control it:
 ## Daily Summary
 
 Every day at **8:00 AM EST**, LuigiBot automatically posts a summary of all active tasks to the configured to-do channel and pings you. At **7:45 AM EST**, it checks whether any recurring tasks are due to be re-added to the list.
+
+### Discipline Tracker Data
+
+**Schema:**
+- `TASK`: Name of the discipline item
+- `CATAGORY`: Category label for grouping
+- `FREQUENCY_PER_WEEK`: How often this should be completed weekly (1–7)
+
+**Storage:**
+- Active items: `to_do_list/discipline_list.pkl`
+- Completion log: `to_do_list/discipline_completion_log.pkl` (tracks date and timestamp for each completion)
+
+---
+
+### Discipline Tracking Schedule
+
+- Every day at **11:15 PM ET**, LuigiBot posts a reminder showing only discipline items not yet logged as completed.
+- **Interactive buttons** (numbered 1–9) appear on the reminder for quick completion logging:
+  - Click a button to mark that task as **completed** for the day (logs the completion event).
+  - Click the same button again to mark it as **incomplete** (removes the completion event).
+- Once you log an item, it is hidden from the nightly reminder for that day.
+- The reminder counts progress ("Pending: X | Logged: Y") so you know what still needs logging.
+- These nightly reminder messages are automatically deleted after `Discipline_Delete_After_Seconds` (default: 2 hours).
+- Use `/today_completions` to view all items you've logged for a specific date.
 
 ---
 
