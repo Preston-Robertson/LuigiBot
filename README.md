@@ -1,4 +1,4 @@
-# LuigiBot 🤖
+# LuigiBot 
 
 A personal Discord bot for managing your to-do list directly from a Discord channel. Create tasks, track their progress, log hours, and get a daily morning summary — all without leaving Discord.
 
