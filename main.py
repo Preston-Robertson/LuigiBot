@@ -37,7 +37,8 @@ with open(f'config.json') as f:
 
 
 # Set-up the TCGbothelper channel and command
-bot = commands.Bot(command_prefix="!L ", intents=discord.Intents.all())
+command_prefix = "!L "
+bot = commands.Bot(command_prefix=command_prefix, intents=discord.Intents.all())
 
 channel_id = config['Channel_ID']
 user_id = config['User_ID']
@@ -214,7 +215,7 @@ def build_discipline_daily_embed(discipline_df, completion_log_df, now_est):
     )
 
     if discipline_df.empty:
-        embed.add_field(name="No Tracked Items", value="Use /create_discipline_task to add items to track.", inline=False)
+        embed.add_field(name="No Tracked Items", value=f"Use {command_prefix}create_discipline_task to add items to track.", inline=False)
         return embed
 
     today = pd.to_datetime(now_est.date()).normalize()
@@ -249,7 +250,7 @@ def build_discipline_daily_embed(discipline_df, completion_log_df, now_est):
 
     pending_count = len(pending_tasks)
     logged_count = len(logged_tasks)
-    embed.set_footer(text=f"Pending: {pending_count} | Logged: {logged_count} | Use /log_discipline_completion to log")
+    embed.set_footer(text=f"Pending: {pending_count} | Logged: {logged_count} | Use {command_prefix}log_discipline_completion to log")
 
     return embed
 
@@ -429,7 +430,7 @@ class DisciplineTaskButton(discord.ui.Button):
                 )
             else:
                 await interaction.response.send_message(
-                    f"❌ Task not found. Use /discipline_list to view tracked items.",
+                    f"❌ Task not found. Use {command_prefix}discipline_list to view tracked items.",
                     ephemeral=True,
                     delete_after=30,
                 )
@@ -480,8 +481,8 @@ async def on_ready():
             name="📋 To-Do List Commands",
             value=(
                 "`/hello` — Greeting test command\n"
-                "`/to_do_list` — View active to-do items (sorted by priority & due date)\n"
-                "`/create_task` — Create a new to-do task with metadata (priority, due date, estimated time, etc.)\n"
+                f"`/to_do_list` or `{command_prefix}to_do_list` — View active to-do items (sorted by priority & due date)\n"
+                f"`/create_task` or `{command_prefix}create_task` — Create a new to-do task with metadata (priority, due date, estimated time, etc.)\n"
             ),
             inline=False,
         )
@@ -489,10 +490,11 @@ async def on_ready():
         embed.add_field(
             name="🎯 Discipline Tracker Commands",
             value=(
-                "`/create_discipline_task` — Add a discipline item (task name, category, frequency/week 1-7)\n"
-                "`/discipline_list` — View all tracked discipline items\n"
-                "`/log_discipline_completion` — Log completion of a discipline task (for data collection)\n"
-                "`/today_completions` — View today's logged discipline completions (or any date)\n"
+                f"`{command_prefix}create_discipline_task` — Add a discipline item (task name, category, frequency/week 1-7)\n"
+                f"`{command_prefix}discipline_list` — View all tracked discipline items\n"
+                f"`{command_prefix}log_discipline_completion` — Log completion of a discipline task (for data collection)\n"
+                f"`{command_prefix}today_completions` — View today's logged discipline completions (or any date)\n"
+                f"`{command_prefix}weekly_discipline_report` — Weekly progress report vs frequency targets\n"
             ),
             inline=False,
         )
@@ -517,7 +519,7 @@ async def on_ready():
             inline=False,
         )
 
-        embed.set_footer(text="Use /command_name to run any command. Nightly reminders have interactive buttons!")
+        embed.set_footer(text=f"Use slash commands or '{command_prefix}' prefix commands as listed above. Nightly reminders have interactive buttons!")
 
         await luigi_channel.send(embed=embed)
     else:
@@ -790,12 +792,7 @@ async def create_task(ctx,
         await ctx.send(f"Something went wrong: {e}")
 
 
-@bot.hybrid_command(name = "create_discipline_task", description = "Create a task in the separate discipline tracker")
-@app_commands.describe(
-        task_name = "The name of the discipline item",
-        catagory = "The category for this discipline item",
-        frequency_per_week = "How often this should be completed weekly (1 to 7)",
-)
+@bot.command(name = "create_discipline_task", help = "Create a task in the separate discipline tracker")
 async def create_discipline_task(
     ctx,
     task_name,
@@ -834,7 +831,7 @@ async def create_discipline_task(
         await ctx.send(f"Something went wrong: {e}")
 
 
-@bot.hybrid_command(name = "discipline_list", description= "The separate discipline tracker list")
+@bot.command(name = "discipline_list", help= "The separate discipline tracker list")
 async def discipline_list(ctx):
     ensure_discipline_dataframe_exists()
     discipline_df = pd.read_pickle(path_for_discipline_list)
@@ -856,11 +853,7 @@ async def discipline_list(ctx):
     await ctx.channel.send(embed=embed, delete_after=120)
 
 
-@bot.hybrid_command(name = "log_discipline_completion", description= "Log a completed discipline item for data collection")
-@app_commands.describe(
-    task_name = "Task name from your discipline tracker",
-    completed_date = "Date completed (YYYYMMDD). Leave blank for today",
-)
+@bot.command(name = "log_discipline_completion", help= "Log a completed discipline item for data collection")
 async def log_discipline_completion(ctx, task_name, completed_date=None):
     ensure_discipline_dataframe_exists()
     ensure_discipline_completion_log_exists()
@@ -869,7 +862,7 @@ async def log_discipline_completion(ctx, task_name, completed_date=None):
     task_match = discipline_df[discipline_df["TASK"].astype(str).str.lower() == str(task_name).strip().lower()]
 
     if task_match.empty:
-        await ctx.send("Task not found in discipline tracker. Use /discipline_list to view tracked items.", delete_after=60)
+        await ctx.send(f"Task not found in discipline tracker. Use {command_prefix}discipline_list to view tracked items.", delete_after=60)
         return
 
     task_row = task_match.iloc[0]
@@ -892,10 +885,7 @@ async def log_discipline_completion(ctx, task_name, completed_date=None):
     await ctx.send(f"Logged completion for '{task_row['TASK']}' on {logged_date}.", delete_after=60)
 
 
-@bot.hybrid_command(name = "today_completions", description= "View discipline items you've logged as completed today")
-@app_commands.describe(
-    date = "Date to check (YYYYMMDD). Leave blank for today",
-)
+@bot.command(name = "today_completions", help= "View discipline items you've logged as completed today")
 async def today_completions(ctx, date=None):
     ensure_discipline_completion_log_exists()
 
@@ -946,6 +936,86 @@ async def today_completions(ctx, date=None):
         embed.set_footer(text=f"Total logged: {len(grouped_by_task)}")
 
     await ctx.send(embed=embed, delete_after=120)
+
+
+@bot.command(name = "weekly_discipline_report", help= "Weekly discipline progress vs frequency targets")
+async def weekly_discipline_report(ctx, week_start=None):
+    ensure_discipline_dataframe_exists()
+    ensure_discipline_completion_log_exists()
+
+    discipline_df = pd.read_pickle(path_for_discipline_list)
+    if discipline_df.empty:
+        await ctx.send("No discipline tasks are currently tracked.", delete_after=60)
+        return
+
+    today = pd.to_datetime(datetime.datetime.now().date()).normalize()
+    if week_start in (None, ""):
+        start_date = today - pd.Timedelta(days=int(today.weekday()))
+    else:
+        try:
+            parsed_start = pd.to_datetime(week_start).normalize()
+            start_date = parsed_start - pd.Timedelta(days=int(parsed_start.weekday()))
+        except Exception:
+            await ctx.send("Invalid week_start format. Use YYYYMMDD (e.g., 20260511).", delete_after=60)
+            return
+
+    end_date = start_date + pd.Timedelta(days=6)
+
+    completion_df = pd.read_pickle(path_for_discipline_completion_log)
+    if completion_df.empty:
+        weekly_df = completion_df
+    else:
+        completion_df = completion_df.copy()
+        completion_df["COMPLETED_DATE"] = pd.to_datetime(completion_df["COMPLETED_DATE"]).dt.normalize()
+        weekly_df = completion_df[
+            (completion_df["COMPLETED_DATE"] >= start_date)
+            & (completion_df["COMPLETED_DATE"] <= end_date)
+        ]
+
+    # Count unique completion days per task so duplicate logs on one day do not inflate progress.
+    weekly_counts = {}
+    if not weekly_df.empty:
+        weekly_counts = weekly_df.groupby("TASK")["COMPLETED_DATE"].nunique().to_dict()
+
+    report_df = discipline_df.copy()
+    report_df["TASK"] = report_df["TASK"].astype(str)
+    report_df["FREQUENCY_PER_WEEK"] = pd.to_numeric(report_df["FREQUENCY_PER_WEEK"], errors="coerce").fillna(1).astype(int)
+    report_df["FREQUENCY_PER_WEEK"] = report_df["FREQUENCY_PER_WEEK"].clip(lower=1, upper=7)
+    report_df["COMPLETIONS_THIS_WEEK"] = report_df["TASK"].map(weekly_counts).fillna(0).astype(int)
+
+    total_target = int(report_df["FREQUENCY_PER_WEEK"].sum())
+    total_actual = int(report_df["COMPLETIONS_THIS_WEEK"].sum())
+    overall_percent = (min(total_actual / total_target, 1) * 100) if total_target > 0 else 0
+
+    embed = discord.Embed(
+        title=f"Weekly Discipline Report ({start_date.strftime('%m/%d')} - {end_date.strftime('%m/%d')})",
+        description="Progress against each task's weekly target frequency.",
+        color=0xF1C40F,
+    )
+
+    sorted_report = report_df.sort_values(by=["FREQUENCY_PER_WEEK", "TASK"], ascending=[False, True])
+    count = 0
+    for _, row in sorted_report.iterrows():
+        if count >= 20:
+            break
+        task_name = str(row["TASK"])
+        catagory = str(row["CATAGORY"])
+        target = int(row["FREQUENCY_PER_WEEK"])
+        actual = int(row["COMPLETIONS_THIS_WEEK"])
+        percent = round(min(actual / target, 1) * 100, 1) if target > 0 else 0
+        extra = f" (+{actual - target})" if actual > target else ""
+        value = (
+            f"Category: {catagory}\n"
+            f"This Week: {actual}/{target}{extra}\n"
+            f"Progress: {percent}%"
+        )
+        embed.add_field(name=f"{count + 1}. {task_name}", value=value, inline=False)
+        count += 1
+
+    embed.set_footer(
+        text=f"Overall: {total_actual}/{total_target} ({round(overall_percent, 1)}%) | Use {command_prefix}weekly_discipline_report YYYYMMDD"
+    )
+    await ctx.send(embed=embed, delete_after=180)
 
 
 #%%
