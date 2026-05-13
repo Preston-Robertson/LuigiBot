@@ -37,13 +37,222 @@ with open(f'config.json') as f:
 
 
 # Set-up the TCGbothelper channel and command
-bot = commands.Bot(command_prefix="!L ", intents=discord.Intents.all())
+command_prefix = "!L "
+bot = commands.Bot(command_prefix=command_prefix, intents=discord.Intents.all())
 
 channel_id = config['Channel_ID']
 user_id = config['User_ID']
 
 path_for_to_do_list = "to_do_list\\to_do_list.pkl"
 path_for_recurring_tasks = "to_do_list\\recurring_tasks.pkl"
+path_for_discipline_list = config.get("Discipline_List_Path", "to_do_list\\discipline_list.pkl")
+path_for_discipline_completion_log = config.get("Discipline_Completion_Log_Path", "to_do_list\\discipline_completion_log.pkl")
+
+discipline_delete_after_seconds = int(config.get("Discipline_Delete_After_Seconds", 7200))
+discipline_daily_hour = int(config.get("Discipline_Daily_Hour", 23))
+discipline_daily_minute = int(config.get("Discipline_Daily_Minute", 15))
+
+last_discipline_daily_date = None
+
+
+def build_tracker_row(
+    task_name,
+    catagory,
+    group=None,
+    subgroup=None,
+    relevant_link=None,
+    recurring=False,
+    recurring_interval=None,
+    due_date=None,
+    priority=1,
+    estimated_time=None,
+):
+    return pd.DataFrame(
+        {
+            "TASK": task_name,
+            "TASK CREATION": pd.to_datetime(datetime.datetime.now().isoformat(' ', 'seconds')),
+            "CATAGORY": pd.Categorical([catagory]),
+            "GROUP": group,
+            "SUB-GROUP": subgroup,
+            "RELEVANT LINK": relevant_link,
+            "RECURRING": recurring,
+            "RECURRING INTERVAL": recurring_interval,
+            "DUE DATE": pd.to_datetime(due_date),
+            "PRIORITY": priority,
+            "STATUS": pd.Categorical(
+                ["Not Started"],
+                categories=[
+                    "Not Started",
+                    "In Progress",
+                    "Pending",
+                    "Blocked",
+                    "Hiatus",
+                    "Completed",
+                ],
+                ordered=True,
+            ),
+            "START TIME": None,
+            "ESTIMATED TIME": estimated_time,
+            "LOGGED HOURS": 0,
+            "COMPLETED": False,
+            "COMPLETED TIME": None,
+        }
+    )
+
+
+def normalize_due_date(due_date):
+    if due_date == "Today" or due_date == "today" or due_date == "td" or due_date == "TD":
+        return datetime.datetime.now().date()
+    if due_date == "Tomorrow" or due_date == "tomorrow" or due_date == "tmw" or due_date == "TMw":
+        return datetime.datetime.now().date() + datetime.timedelta(days=1)
+    if due_date == "Week" or due_date == "week" or due_date == "WK" or due_date == "wk":
+        return datetime.datetime.now().date() + datetime.timedelta(weeks=1)
+    return due_date
+
+
+def build_discipline_row(task_name, catagory, frequency_per_week):
+    return pd.DataFrame(
+        {
+            "TASK": [task_name],
+            "CATAGORY": [catagory],
+            "FREQUENCY_PER_WEEK": [int(frequency_per_week)],
+        }
+    )
+
+
+def build_discipline_completion_row(task_name, catagory, completed_date):
+    completed_dt = pd.to_datetime(completed_date)
+    return pd.DataFrame(
+        {
+            "TASK": [task_name],
+            "CATAGORY": [catagory],
+            "COMPLETED_DATE": [completed_dt.normalize()],
+            "LOGGED_AT": [pd.to_datetime(datetime.datetime.now().isoformat(' ', 'seconds'))],
+        }
+    )
+
+
+def ensure_discipline_dataframe_exists():
+    os.makedirs(os.path.dirname(path_for_discipline_list), exist_ok=True)
+
+    expected_cols = ["TASK", "CATAGORY", "FREQUENCY_PER_WEEK"]
+
+    if os.path.exists(path_for_discipline_list):
+        try:
+            existing_df = pd.read_pickle(path_for_discipline_list)
+            if set(expected_cols).issubset(existing_df.columns):
+                existing_df = existing_df[expected_cols].copy()
+                existing_df["FREQUENCY_PER_WEEK"] = pd.to_numeric(existing_df["FREQUENCY_PER_WEEK"], errors="coerce").fillna(1).astype(int)
+                existing_df["FREQUENCY_PER_WEEK"] = existing_df["FREQUENCY_PER_WEEK"].clip(lower=1, upper=7)
+                existing_df.to_pickle(path_for_discipline_list)
+                return
+
+            migrated_df = pd.DataFrame(
+                {
+                    "TASK": existing_df["TASK"].astype(str) if "TASK" in existing_df.columns else pd.Series(dtype="object"),
+                    "CATAGORY": existing_df["CATAGORY"].astype(str) if "CATAGORY" in existing_df.columns else "Discipline",
+                    "FREQUENCY_PER_WEEK": 1,
+                }
+            )
+            migrated_df.to_pickle(path_for_discipline_list)
+            return
+        except Exception:
+            pass
+
+    pd.DataFrame(columns=expected_cols).to_pickle(path_for_discipline_list)
+
+
+def ensure_discipline_completion_log_exists():
+    os.makedirs(os.path.dirname(path_for_discipline_completion_log), exist_ok=True)
+
+    expected_cols = ["TASK", "CATAGORY", "COMPLETED_DATE", "LOGGED_AT"]
+
+    if os.path.exists(path_for_discipline_completion_log):
+        try:
+            existing_df = pd.read_pickle(path_for_discipline_completion_log)
+            if set(expected_cols).issubset(existing_df.columns):
+                existing_df = existing_df[expected_cols].copy()
+                existing_df.to_pickle(path_for_discipline_completion_log)
+                return
+        except Exception:
+            pass
+
+    pd.DataFrame(columns=expected_cols).to_pickle(path_for_discipline_completion_log)
+
+
+def get_discipline_channel():
+    discipline_channel_id = config.get("Channel_ID_discipline")
+    if discipline_channel_id:
+        return bot.get_channel(discipline_channel_id)
+    if config.get("Channel_ID_to_do"):
+        return bot.get_channel(config["Channel_ID_to_do"])
+    return bot.get_channel(channel_id)
+
+
+def get_active_discipline_df(discipline_list_df):
+    filtered_df = discipline_list_df.copy()
+
+    if filtered_df.empty:
+        return filtered_df
+
+    return filtered_df.sort_values(by=["FREQUENCY_PER_WEEK", "TASK"], ascending=[False, True])
+
+
+def get_task_completed_today(task_name, completion_log_df, target_date):
+    target_date_normalized = pd.to_datetime(target_date).normalize()
+    matching = completion_log_df[
+        (completion_log_df["TASK"].astype(str).str.lower() == str(task_name).strip().lower())
+        & (completion_log_df["COMPLETED_DATE"] == target_date_normalized)
+    ]
+    return not matching.empty
+
+
+def build_discipline_daily_embed(discipline_df, completion_log_df, now_est):
+    embed = discord.Embed(
+        title=f"Discipline Tracker - {now_est.strftime('%m/%d/%Y')}",
+        description="End-of-day reminder: log what you completed today.",
+        color=0x2ECC71,
+    )
+
+    if discipline_df.empty:
+        embed.add_field(name="No Tracked Items", value=f"Use {command_prefix}create_discipline_task to add items to track.", inline=False)
+        return embed
+
+    today = pd.to_datetime(now_est.date()).normalize()
+    pending_tasks = []
+    logged_tasks = []
+
+    for _, row in discipline_df.iterrows():
+        task_name = str(row["TASK"])
+        if get_task_completed_today(task_name, completion_log_df, today):
+            logged_tasks.append(task_name)
+        else:
+            pending_tasks.append(row)
+
+    if not pending_tasks:
+        embed.add_field(
+            name="All Done!",
+            value=f"You've logged all {len(logged_tasks)} discipline items for today.",
+            inline=False,
+        )
+        if logged_tasks:
+            embed.set_footer(text="Logged: " + ", ".join(logged_tasks[:5]) + ("..." if len(logged_tasks) > 5 else ""))
+        return embed
+
+    count = 0
+    for row in pending_tasks:
+        if count >= 20:
+            break
+        task_name = str(row["TASK"])
+        value = f"Category: {row['CATAGORY']}\nFrequency/Week: {row['FREQUENCY_PER_WEEK']}"
+        embed.add_field(name=f"{count + 1}. {task_name}", value=value, inline=False)
+        count += 1
+
+    pending_count = len(pending_tasks)
+    logged_count = len(logged_tasks)
+    embed.set_footer(text=f"Pending: {pending_count} | Logged: {logged_count} | Use {command_prefix}log_discipline_completion to log")
+
+    return embed
 
 # --- Button Views ---
 
@@ -178,6 +387,66 @@ class TaskActionView(discord.ui.View):
         await msg.delete(delay=30)
 
 
+# --- Discipline Tracker Button Views ---
+
+class DisciplineTaskButton(discord.ui.Button):
+    def __init__(self, index, task_name):
+        super().__init__(label=str(index + 1), style=discord.ButtonStyle.secondary)
+        self.index = index
+        self.task_name = task_name
+
+    async def callback(self, interaction: discord.Interaction):
+        ensure_discipline_dataframe_exists()
+        ensure_discipline_completion_log_exists()
+
+        today = pd.to_datetime(datetime.datetime.now().date()).normalize()
+        completion_df = pd.read_pickle(path_for_discipline_completion_log)
+        is_logged = get_task_completed_today(self.task_name, completion_df, today)
+
+        if is_logged:
+            completion_df_filtered = completion_df[
+                ~((completion_df["TASK"].astype(str).str.lower() == str(self.task_name).strip().lower())
+                  & (completion_df["COMPLETED_DATE"] == today))
+            ]
+            completion_df_filtered.to_pickle(path_for_discipline_completion_log)
+            await interaction.response.send_message(
+                f"✅ Marked '{self.task_name}' as incomplete for today.",
+                ephemeral=True,
+                delete_after=30,
+            )
+        else:
+            discipline_df = pd.read_pickle(path_for_discipline_list)
+            task_match = discipline_df[discipline_df["TASK"].astype(str).str.lower() == str(self.task_name).strip().lower()]
+            if not task_match.empty:
+                task_row = task_match.iloc[0]
+                catagory = str(task_row["CATAGORY"])
+                completion_row = build_discipline_completion_row(self.task_name, catagory, today)
+                updated_df = pd.concat([completion_df, completion_row], ignore_index=True)
+                updated_df.to_pickle(path_for_discipline_completion_log)
+                await interaction.response.send_message(
+                    f"✅ Logged '{self.task_name}' as completed for today.",
+                    ephemeral=True,
+                    delete_after=30,
+                )
+            else:
+                await interaction.response.send_message(
+                    f"❌ Task not found. Use {command_prefix}discipline_list to view tracked items.",
+                    ephemeral=True,
+                    delete_after=30,
+                )
+
+
+class DisciplineTaskView(discord.ui.View):
+    """Numbered buttons for logging discipline task completions."""
+    def __init__(self, pending_tasks):
+        super().__init__(timeout=300)
+        self.pending_tasks = pending_tasks
+        for i, task_row in enumerate(pending_tasks):
+            if i >= 9:
+                break
+            task_name = str(task_row["TASK"])
+            self.add_item(DisciplineTaskButton(index=i, task_name=task_name))
+
 
 # %%
 # Bot Start-up Process
@@ -196,13 +465,66 @@ async def on_ready():
     except Exception as e:
         print(f"Error syncing commands: {e}")
     
+    ensure_discipline_dataframe_exists()
+    ensure_discipline_completion_log_exists()
     send_daily_message.start()
 
     if luigi_channel:
-        await luigi_channel.send("I'm Ready")
+        # Create a comprehensive command list embed
+        embed = discord.Embed(
+            title="🤖 LuigiBot Startup — Available Commands",
+            description="All commands and their functions",
+            color=0x1E90FF,
+        )
+
+        embed.add_field(
+            name="📋 To-Do List Commands",
+            value=(
+                "`/hello` — Greeting test command\n"
+                f"`/to_do_list` or `{command_prefix}to_do_list` — View active to-do items (sorted by priority & due date)\n"
+                f"`/create_task` or `{command_prefix}create_task` — Create a new to-do task with metadata (priority, due date, estimated time, etc.)\n"
+            ),
+            inline=False,
+        )
+
+        embed.add_field(
+            name="🎯 Discipline Tracker Commands",
+            value=(
+                f"`{command_prefix}create_discipline_task` — Add a discipline item (task name, category, frequency/week 1-7)\n"
+                f"`{command_prefix}discipline_list` — View all tracked discipline items\n"
+                f"`{command_prefix}log_discipline_completion` — Log completion of a discipline task (for data collection)\n"
+                f"`{command_prefix}today_completions` — View today's logged discipline completions (or any date)\n"
+                f"`{command_prefix}weekly_discipline_report` — Weekly progress report vs frequency targets\n"
+            ),
+            inline=False,
+        )
+
+        embed.add_field(
+            name="⏰ Scheduled Events",
+            value=(
+                "**7:45 AM ET** — Check & re-add recurring to-do tasks\n"
+                "**8:00 AM ET** — Daily to-do list summary\n"
+                "**11:00 PM ET** — Tasks completed today summary\n"
+                "**11:15 PM ET** — Discipline tracker nightly reminder (with interactive buttons)\n"
+            ),
+            inline=False,
+        )
+
+        embed.add_field(
+            name="💾 Data Storage",
+            value=(
+                "**To-Do:** `to_do_list.pkl`, `recurring_tasks.pkl`\n"
+                "**Discipline:** `discipline_list.pkl`, `discipline_completion_log.pkl`\n"
+            ),
+            inline=False,
+        )
+
+        embed.set_footer(text=f"Use slash commands or '{command_prefix}' prefix commands as listed above. Nightly reminders have interactive buttons!")
+
+        await luigi_channel.send(embed=embed)
     else:
         print("Channel not found.")
-    # Once bot start-up is done, it will send "I'm Ready"
+    # Once bot start-up is done, it will send command list
 
 
 #%%
@@ -260,6 +582,8 @@ async def to_do_list(ctx):
 
 # This command outputs the To-Do List Summary at 12:45 AM EST daily
 async def send_daily_message():
+    global last_discipline_daily_date
+
     est = pytz.timezone('US/Eastern')
     now = datetime.datetime.now(est)
 
@@ -351,6 +675,38 @@ async def send_daily_message():
             await to_do_list_channel.send(f"<@{user_id}>, Task Completed Today: {datetime.datetime.now().strftime('%m/%d/%Y')}")
             await to_do_list_channel.send(embed=embed)
 
+    if now.hour == discipline_daily_hour and now.minute == discipline_daily_minute:
+        if last_discipline_daily_date != now.date():
+            discipline_channel = get_discipline_channel()
+            if discipline_channel:
+                try:
+                    discipline_list_df = pd.read_pickle(path_for_discipline_list)
+                    discipline_df = get_active_discipline_df(discipline_list_df)
+                    completion_log_df = pd.read_pickle(path_for_discipline_completion_log)
+                    embed = build_discipline_daily_embed(discipline_df, completion_log_df, now)
+                    
+                    today = pd.to_datetime(now.date()).normalize()
+                    pending_tasks = []
+                    for _, row in discipline_df.iterrows():
+                        task_name = str(row["TASK"])
+                        if not get_task_completed_today(task_name, completion_log_df, today):
+                            pending_tasks.append(row)
+                    
+                    view = DisciplineTaskView(pending_tasks) if pending_tasks else None
+                    
+                    await discipline_channel.send(
+                        f"<@{user_id}> Discipline check-in ({now.strftime('%I:%M %p ET')}):",
+                        delete_after=discipline_delete_after_seconds,
+                    )
+                    await discipline_channel.send(
+                        embed=embed,
+                        view=view,
+                        delete_after=discipline_delete_after_seconds,
+                    )
+                except Exception as e:
+                    print(f"Error sending discipline daily tracker: {e}")
+            last_discipline_daily_date = now.date()
+
 
 
 
@@ -384,42 +740,20 @@ async def create_task(ctx,
     
 
     
-    if due_date == "Today" or due_date == "today" or due_date == "td" or due_date == "TD":
-        due_date = datetime.datetime.now().date()
+    due_date = normalize_due_date(due_date)
 
-    elif due_date == "Tomorrow" or due_date == "tomorrow" or due_date == "tmw" or due_date == "TMw":
-        due_date = datetime.datetime.now().date() + datetime.timedelta(days=1)
-
-    elif due_date == "Week" or due_date == "week" or due_date == "WK" or due_date == "wk":
-        due_date = datetime.datetime.now().date() + datetime.timedelta(weeks=1)
-
-    to_list_pd = pd.DataFrame(
-    {
-        "TASK": task_name,
-        "TASK CREATION": pd.to_datetime(datetime.datetime.now().isoformat(' ', 'seconds')),
-        "CATAGORY": pd.Categorical([catagory]),
-        "GROUP": group,
-        "SUB-GROUP": subgroup,
-        "RELEVANT LINK": relevant_link, 
-        "RECURRING": recurring,
-        "RECURRING INTERVAL": recurring_interval,
-        "DUE DATE": pd.to_datetime(due_date),
-        "PRIORITY": priority,
-        "STATUS": pd.Categorical(["Not Started"], 
-                                 categories = [
-                                     "Not Started",
-                                     "In Progress",
-                                     "Pending",
-                                     "Blocked",
-                                     "Hiatus",
-                                     "Completed"
-                                               ], 
-                                 ordered= True),
-        "START TIME": None,
-        "ESTIMATED TIME": estimated_time,
-        "LOGGED HOURS": 0,
-        "COMPLETED": False,
-        "COMPLETED TIME": None})
+    to_list_pd = build_tracker_row(
+        task_name=task_name,
+        catagory=catagory,
+        group=group,
+        subgroup=subgroup,
+        relevant_link=relevant_link,
+        recurring=recurring,
+        recurring_interval=recurring_interval,
+        due_date=due_date,
+        priority=priority,
+        estimated_time=estimated_time,
+    )
     
     if recurring and not recurring_interval:
         await ctx.send("Please provide a recurring interval in days for this recurring task.", delete_after=30)
@@ -456,6 +790,232 @@ async def create_task(ctx,
         await ctx.send("Added", delete_after=60)
     except Exception as e:
         await ctx.send(f"Something went wrong: {e}")
+
+
+@bot.command(name = "create_discipline_task", help = "Create a task in the separate discipline tracker")
+async def create_discipline_task(
+    ctx,
+    task_name,
+    catagory,
+    frequency_per_week,
+):
+    ensure_discipline_dataframe_exists()
+
+    try:
+        frequency_per_week = int(frequency_per_week)
+    except ValueError:
+        await ctx.send("frequency_per_week must be a number between 1 and 7.", delete_after=60)
+        return
+
+    if frequency_per_week < 1 or frequency_per_week > 7:
+        await ctx.send("frequency_per_week must be between 1 and 7.", delete_after=60)
+        return
+
+    discipline_row = build_discipline_row(
+        task_name=task_name,
+        catagory=catagory,
+        frequency_per_week=frequency_per_week,
+    )
+
+    try:
+        discipline_df = pd.read_pickle(path_for_discipline_list)
+    except FileNotFoundError:
+        discipline_df = discipline_row.iloc[0:0]
+
+    updated_df = pd.concat([discipline_row, discipline_df], ignore_index=True)
+
+    try:
+        updated_df.to_pickle(path_for_discipline_list)
+        await ctx.send("Added to separate discipline tracker.", delete_after=60)
+    except Exception as e:
+        await ctx.send(f"Something went wrong: {e}")
+
+
+@bot.command(name = "discipline_list", help= "The separate discipline tracker list")
+async def discipline_list(ctx):
+    ensure_discipline_dataframe_exists()
+    discipline_df = pd.read_pickle(path_for_discipline_list)
+    filtered_df = get_active_discipline_df(discipline_df)
+
+    embed = discord.Embed(title="Discipline Tracker", color=0x2ECC71)
+    count = 0
+    for _, row in filtered_df.loc[:, ["TASK", "CATAGORY", "FREQUENCY_PER_WEEK"]].astype(str).iterrows():
+        if count >= 20:
+            break
+        task_name = row["TASK"]
+        value = f"Category: {row['CATAGORY']}\nFrequency/Week: {row['FREQUENCY_PER_WEEK']}\n"
+        embed.add_field(name=f"{count+1}. {task_name}", value=value, inline=False)
+        count += 1
+
+    if count == 0:
+        embed.add_field(name="No Tracked Items", value="No discipline tasks are currently tracked.", inline=False)
+
+    await ctx.channel.send(embed=embed, delete_after=120)
+
+
+@bot.command(name = "log_discipline_completion", help= "Log a completed discipline item for data collection")
+async def log_discipline_completion(ctx, task_name, completed_date=None):
+    ensure_discipline_dataframe_exists()
+    ensure_discipline_completion_log_exists()
+
+    discipline_df = pd.read_pickle(path_for_discipline_list)
+    task_match = discipline_df[discipline_df["TASK"].astype(str).str.lower() == str(task_name).strip().lower()]
+
+    if task_match.empty:
+        await ctx.send(f"Task not found in discipline tracker. Use {command_prefix}discipline_list to view tracked items.", delete_after=60)
+        return
+
+    task_row = task_match.iloc[0]
+    catagory = str(task_row["CATAGORY"])
+
+    if completed_date in (None, ""):
+        completed_date = datetime.datetime.now().date()
+
+    completion_row = build_discipline_completion_row(task_name=task_row["TASK"], catagory=catagory, completed_date=completed_date)
+
+    try:
+        completion_df = pd.read_pickle(path_for_discipline_completion_log)
+    except FileNotFoundError:
+        completion_df = completion_row.iloc[0:0]
+
+    updated_completion_df = pd.concat([completion_df, completion_row], ignore_index=True)
+    updated_completion_df.to_pickle(path_for_discipline_completion_log)
+
+    logged_date = pd.to_datetime(completion_row["COMPLETED_DATE"].iloc[0]).strftime("%m/%d/%Y")
+    await ctx.send(f"Logged completion for '{task_row['TASK']}' on {logged_date}.", delete_after=60)
+
+
+@bot.command(name = "today_completions", help= "View discipline items you've logged as completed today")
+async def today_completions(ctx, date=None):
+    ensure_discipline_completion_log_exists()
+
+    if date in (None, ""):
+        target_date = pd.to_datetime(datetime.datetime.now().date()).normalize()
+        display_date = datetime.datetime.now().strftime("%m/%d/%Y")
+    else:
+        try:
+            target_date = pd.to_datetime(date).normalize()
+            display_date = target_date.strftime("%m/%d/%Y")
+        except Exception as e:
+            await ctx.send(f"Invalid date format. Use YYYYMMDD (e.g., 20260511).", delete_after=60)
+            return
+
+    completion_df = pd.read_pickle(path_for_discipline_completion_log)
+    today_logged = completion_df[completion_df["COMPLETED_DATE"] == target_date].copy()
+
+    embed = discord.Embed(
+        title=f"Discipline Completions - {display_date}",
+        description="Items logged as completed on this date.",
+        color=0x3498DB,
+    )
+
+    if today_logged.empty:
+        embed.add_field(name="No Completions Logged", value="No items logged for this date.", inline=False)
+        await ctx.send(embed=embed, delete_after=120)
+        return
+
+    count = 0
+    grouped_by_task = today_logged.groupby("TASK").agg({
+        "CATAGORY": "first",
+        "LOGGED_AT": "min",
+    }).reset_index()
+
+    for _, row in grouped_by_task.iterrows():
+        if count >= 20:
+            break
+        task_name = str(row["TASK"])
+        catagory = str(row["CATAGORY"])
+        logged_at = pd.to_datetime(row["LOGGED_AT"]).strftime("%I:%M %p")
+        value = f"Category: {catagory}\nLogged at: {logged_at}"
+        embed.add_field(name=f"{count + 1}. {task_name}", value=value, inline=False)
+        count += 1
+
+    if len(grouped_by_task) > 20:
+        embed.set_footer(text=f"Showing top 20 of {len(grouped_by_task)} completions")
+    else:
+        embed.set_footer(text=f"Total logged: {len(grouped_by_task)}")
+
+    await ctx.send(embed=embed, delete_after=120)
+
+
+@bot.command(name = "weekly_discipline_report", help= "Weekly discipline progress vs frequency targets")
+async def weekly_discipline_report(ctx, week_start=None):
+    ensure_discipline_dataframe_exists()
+    ensure_discipline_completion_log_exists()
+
+    discipline_df = pd.read_pickle(path_for_discipline_list)
+    if discipline_df.empty:
+        await ctx.send("No discipline tasks are currently tracked.", delete_after=60)
+        return
+
+    today = pd.to_datetime(datetime.datetime.now().date()).normalize()
+    if week_start in (None, ""):
+        start_date = today - pd.Timedelta(days=int(today.weekday()))
+    else:
+        try:
+            parsed_start = pd.to_datetime(week_start).normalize()
+            start_date = parsed_start - pd.Timedelta(days=int(parsed_start.weekday()))
+        except Exception:
+            await ctx.send("Invalid week_start format. Use YYYYMMDD (e.g., 20260511).", delete_after=60)
+            return
+
+    end_date = start_date + pd.Timedelta(days=6)
+
+    completion_df = pd.read_pickle(path_for_discipline_completion_log)
+    if completion_df.empty:
+        weekly_df = completion_df
+    else:
+        completion_df = completion_df.copy()
+        completion_df["COMPLETED_DATE"] = pd.to_datetime(completion_df["COMPLETED_DATE"]).dt.normalize()
+        weekly_df = completion_df[
+            (completion_df["COMPLETED_DATE"] >= start_date)
+            & (completion_df["COMPLETED_DATE"] <= end_date)
+        ]
+
+    # Count unique completion days per task so duplicate logs on one day do not inflate progress.
+    weekly_counts = {}
+    if not weekly_df.empty:
+        weekly_counts = weekly_df.groupby("TASK")["COMPLETED_DATE"].nunique().to_dict()
+
+    report_df = discipline_df.copy()
+    report_df["TASK"] = report_df["TASK"].astype(str)
+    report_df["FREQUENCY_PER_WEEK"] = pd.to_numeric(report_df["FREQUENCY_PER_WEEK"], errors="coerce").fillna(1).astype(int)
+    report_df["FREQUENCY_PER_WEEK"] = report_df["FREQUENCY_PER_WEEK"].clip(lower=1, upper=7)
+    report_df["COMPLETIONS_THIS_WEEK"] = report_df["TASK"].map(weekly_counts).fillna(0).astype(int)
+
+    total_target = int(report_df["FREQUENCY_PER_WEEK"].sum())
+    total_actual = int(report_df["COMPLETIONS_THIS_WEEK"].sum())
+    overall_percent = (min(total_actual / total_target, 1) * 100) if total_target > 0 else 0
+
+    embed = discord.Embed(
+        title=f"Weekly Discipline Report ({start_date.strftime('%m/%d')} - {end_date.strftime('%m/%d')})",
+        description="Progress against each task's weekly target frequency.",
+        color=0xF1C40F,
+    )
+
+    sorted_report = report_df.sort_values(by=["FREQUENCY_PER_WEEK", "TASK"], ascending=[False, True])
+    count = 0
+    for _, row in sorted_report.iterrows():
+        if count >= 20:
+            break
+        task_name = str(row["TASK"])
+        catagory = str(row["CATAGORY"])
+        target = int(row["FREQUENCY_PER_WEEK"])
+        actual = int(row["COMPLETIONS_THIS_WEEK"])
+        percent = round(min(actual / target, 1) * 100, 1) if target > 0 else 0
+        extra = f" (+{actual - target})" if actual > target else ""
+        value = (
+            f"Category: {catagory}\n"
+            f"This Week: {actual}/{target}{extra}\n"
+            f"Progress: {percent}%"
+        )
+        embed.add_field(name=f"{count + 1}. {task_name}", value=value, inline=False)
+        count += 1
+
+    embed.set_footer(
+        text=f"Overall: {total_actual}/{total_target} ({round(overall_percent, 1)}%) | Use {command_prefix}weekly_discipline_report YYYYMMDD"
+    )
+    await ctx.send(embed=embed, delete_after=180)
 
 
 #%%
