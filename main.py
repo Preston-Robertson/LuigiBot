@@ -11,14 +11,16 @@ import json
 import os
 import datetime
 import pytz
-#import io
+from io import BytesIO
 
 # For Slash Commands
 from discord import app_commands
 from discord import interactions
 
 # For Data 
-from matplotlib import lines
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import pandas as pd
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
@@ -53,6 +55,8 @@ discipline_daily_hour = int(config.get("Discipline_Daily_Hour", 23))
 discipline_daily_minute = int(config.get("Discipline_Daily_Minute", 15))
 
 last_discipline_daily_date = None
+last_todo_visual_date = None
+last_todo_weekly_visual_date = None
 
 
 def build_tracker_row(
@@ -187,6 +191,216 @@ def get_discipline_channel():
     if config.get("Channel_ID_to_do"):
         return bot.get_channel(config["Channel_ID_to_do"])
     return bot.get_channel(channel_id)
+
+
+def get_todo_channel():
+    to_do_channel_id = config.get("Channel_ID_to_do")
+    if to_do_channel_id:
+        return bot.get_channel(to_do_channel_id)
+    return bot.get_channel(channel_id)
+
+
+def build_completed_task_series(to_do_list_df, end_date, days=7):
+    date_index = pd.date_range(end=pd.to_datetime(end_date).normalize(), periods=days, freq="D")
+
+    if to_do_list_df.empty or "COMPLETED TIME" not in to_do_list_df.columns:
+        return pd.Series([0] * len(date_index), index=date_index, dtype="int64")
+
+    completed_times = pd.to_datetime(to_do_list_df["COMPLETED TIME"], errors="coerce").dt.normalize()
+    completed_times = completed_times.dropna()
+
+    if completed_times.empty:
+        return pd.Series([0] * len(date_index), index=date_index, dtype="int64")
+
+    completion_counts = completed_times.value_counts().sort_index()
+    return completion_counts.reindex(date_index, fill_value=0).astype(int)
+
+
+def render_completed_task_bar_chart(completion_series, chart_title, subtitle=None, highlight_index=None):
+    labels = [dt.strftime("%a\n%m/%d") for dt in completion_series.index]
+    values = completion_series.values.tolist()
+
+    fig, ax = plt.subplots(figsize=(9, 4.5), dpi=150)
+    bar_colors = ["#8FB8FF"] * len(values)
+
+    if highlight_index is not None and 0 <= highlight_index < len(bar_colors):
+        bar_colors[highlight_index] = "#2E6DFF"
+
+    bars = ax.bar(range(len(values)), values, color=bar_colors, width=0.7)
+
+    ax.set_title(chart_title, fontsize=14, fontweight="bold", pad=12)
+    if subtitle:
+        ax.text(0.5, 1.01, subtitle, ha="center", va="bottom", transform=ax.transAxes, fontsize=10, color="#444444")
+
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels, fontsize=9)
+    ax.set_ylabel("Tasks Completed", fontsize=10)
+    ax.grid(axis="y", linestyle="--", alpha=0.25)
+    ax.set_axisbelow(True)
+
+    for bar in bars:
+        height = int(bar.get_height())
+        ax.annotate(
+            str(height),
+            xy=(bar.get_x() + bar.get_width() / 2, height),
+            xytext=(0, 3),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            fontsize=9,
+            color="#1C1C1C",
+        )
+
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
+
+    fig.tight_layout()
+    image_buffer = BytesIO()
+    fig.savefig(image_buffer, format="png", bbox_inches="tight")
+    plt.close(fig)
+    image_buffer.seek(0)
+    return image_buffer
+
+
+def normalize_discipline_completion_df(completion_df):
+    if completion_df.empty:
+        return completion_df
+    normalized = completion_df.copy()
+    normalized["TASK"] = normalized["TASK"].astype(str).str.strip()
+    normalized["COMPLETED_DATE"] = pd.to_datetime(normalized["COMPLETED_DATE"], errors="coerce").dt.normalize()
+    return normalized.dropna(subset=["COMPLETED_DATE"])
+
+
+def build_discipline_weekly_counts(discipline_df, completion_df, start_date, end_date):
+    weekly_counts = {}
+    weekly_counts_before_today = {}
+
+    if not completion_df.empty:
+        completion_df = normalize_discipline_completion_df(completion_df)
+        weekly_df = completion_df[
+            (completion_df["COMPLETED_DATE"] >= start_date)
+            & (completion_df["COMPLETED_DATE"] <= end_date)
+        ]
+
+        if not weekly_df.empty:
+            weekly_counts = weekly_df.groupby("TASK")["COMPLETED_DATE"].nunique().to_dict()
+
+        before_today_df = completion_df[
+            (completion_df["COMPLETED_DATE"] >= start_date)
+            & (completion_df["COMPLETED_DATE"] < end_date)
+        ]
+        if not before_today_df.empty:
+            weekly_counts_before_today = before_today_df.groupby("TASK")["COMPLETED_DATE"].nunique().to_dict()
+
+    report_df = discipline_df.copy()
+    report_df["TASK"] = report_df["TASK"].astype(str).str.strip()
+    report_df["FREQUENCY_PER_WEEK"] = pd.to_numeric(report_df["FREQUENCY_PER_WEEK"], errors="coerce").fillna(1).astype(int)
+    report_df["FREQUENCY_PER_WEEK"] = report_df["FREQUENCY_PER_WEEK"].clip(lower=1, upper=7)
+    report_df["COMPLETIONS_THIS_WEEK"] = report_df["TASK"].map(weekly_counts).fillna(0).astype(int)
+    report_df["COMPLETIONS_BEFORE_END_DATE"] = report_df["TASK"].map(weekly_counts_before_today).fillna(0).astype(int)
+
+    return report_df.sort_values(by=["FREQUENCY_PER_WEEK", "TASK"], ascending=[False, True])
+
+
+def render_discipline_daily_goal_status_chart(status_df, chart_title, subtitle=None):
+    labels = status_df["TASK"].astype(str).tolist()
+    values = status_df["GOAL_MET_BINARY"].astype(int).tolist()
+
+    fig, ax = plt.subplots(figsize=(max(10, len(labels) * 0.75), 4.8), dpi=150)
+
+    x_positions = range(len(labels))
+    for idx, (_, row) in enumerate(status_df.iterrows()):
+        status_code = row["STATUS_CODE"]
+        if status_code == "met_today":
+            ax.bar(idx, 1, color="#2E86DE", width=0.65)
+        elif status_code == "met_before_today":
+            ax.bar(idx, 1, color="#27AE60", width=0.65)
+        elif status_code == "done_today_not_met":
+            ax.bar(idx, 0.15, color="#F39C12", width=0.65)
+        else:
+            ax.bar(idx, 0.02, facecolor="none", edgecolor="#95A5A6", linewidth=1.5, width=0.65)
+
+    ax.set_ylim(0, 1.15)
+    ax.set_xticks(list(x_positions))
+    ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=9)
+    ax.set_yticks([0, 1])
+    ax.set_yticklabels(["Need", "Met"], fontsize=9)
+    ax.set_ylabel("Weekly Goal Status", fontsize=10)
+    ax.set_title(chart_title, fontsize=14, fontweight="bold", pad=12)
+
+    if subtitle:
+        ax.text(0.5, 1.01, subtitle, ha="center", va="bottom", transform=ax.transAxes, fontsize=10, color="#444444")
+
+    ax.grid(axis="y", linestyle="--", alpha=0.2)
+    ax.set_axisbelow(True)
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
+
+    legend_handles = [
+        plt.Rectangle((0, 0), 1, 1, color="#2E86DE", label="Reached Goal Today"),
+        plt.Rectangle((0, 0), 1, 1, color="#27AE60", label="Goal Already Met"),
+        plt.Rectangle((0, 0), 1, 1, color="#F39C12", label="Done Today (Not Met Yet)"),
+        plt.Rectangle((0, 0), 1, 1, facecolor="none", edgecolor="#95A5A6", label="Needs Completion"),
+    ]
+    ax.legend(handles=legend_handles, loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=8)
+
+    fig.tight_layout()
+    image_buffer = BytesIO()
+    fig.savefig(image_buffer, format="png", bbox_inches="tight")
+    plt.close(fig)
+    image_buffer.seek(0)
+    return image_buffer
+
+
+def render_discipline_weekly_progress_chart(report_df, chart_title, subtitle=None):
+    labels = report_df["TASK"].astype(str).tolist()
+    actual = report_df["COMPLETIONS_THIS_WEEK"].astype(int).tolist()
+    target = report_df["FREQUENCY_PER_WEEK"].astype(int).tolist()
+
+    fig, ax = plt.subplots(figsize=(max(10, len(labels) * 0.75), 4.8), dpi=150)
+    x_positions = list(range(len(labels)))
+    width = 0.38
+
+    bars_target = ax.bar([x - width / 2 for x in x_positions], target, width=width, color="#D5DBDB", label="Target")
+    actual_colors = ["#27AE60" if a >= t else "#E74C3C" for a, t in zip(actual, target)]
+    bars_actual = ax.bar([x + width / 2 for x in x_positions], actual, width=width, color=actual_colors, label="Actual")
+
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=9)
+    ax.set_ylabel("Days Completed This Week", fontsize=10)
+    ax.set_title(chart_title, fontsize=14, fontweight="bold", pad=12)
+
+    if subtitle:
+        ax.text(0.5, 1.01, subtitle, ha="center", va="bottom", transform=ax.transAxes, fontsize=10, color="#444444")
+
+    max_y = max(target + actual) if (target or actual) else 1
+    ax.set_ylim(0, max_y + 1)
+    ax.grid(axis="y", linestyle="--", alpha=0.2)
+    ax.set_axisbelow(True)
+    ax.legend(fontsize=9)
+
+    for bars in [bars_target, bars_actual]:
+        for bar in bars:
+            height = int(bar.get_height())
+            ax.annotate(
+                str(height),
+                xy=(bar.get_x() + bar.get_width() / 2, height),
+                xytext=(0, 3),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
+
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
+
+    fig.tight_layout()
+    image_buffer = BytesIO()
+    fig.savefig(image_buffer, format="png", bbox_inches="tight")
+    plt.close(fig)
+    image_buffer.seek(0)
+    return image_buffer
 
 
 def get_active_discipline_df(discipline_list_df):
@@ -483,6 +697,8 @@ async def on_ready():
                 "`/hello` — Greeting test command\n"
                 f"`/to_do_list` or `{command_prefix}to_do_list` — View active to-do items (sorted by priority & due date)\n"
                 f"`/create_task` or `{command_prefix}create_task` — Create a new to-do task with metadata (priority, due date, estimated time, etc.)\n"
+                f"`{command_prefix}to_do_completion_visual` — Post a 7-day completed-task bar chart to the to-do channel\n"
+                f"`{command_prefix}to_do_weekly_visual [week_end]` — Post an end-of-week bar chart to the to-do channel (optional YYYYMMDD)\n"
             ),
             inline=False,
         )
@@ -494,27 +710,9 @@ async def on_ready():
                 f"`{command_prefix}discipline_list` — View all tracked discipline items\n"
                 f"`{command_prefix}log_discipline_completion` — Log completion of a discipline task (for data collection)\n"
                 f"`{command_prefix}today_completions` — View today's logged discipline completions (or any date)\n"
-                f"`{command_prefix}weekly_discipline_report` — Weekly progress report vs frequency targets\n"
-            ),
-            inline=False,
-        )
-
-        embed.add_field(
-            name="⏰ Scheduled Events",
-            value=(
-                "**7:45 AM ET** — Check & re-add recurring to-do tasks\n"
-                "**8:00 AM ET** — Daily to-do list summary\n"
-                "**11:00 PM ET** — Tasks completed today summary\n"
-                "**11:15 PM ET** — Discipline tracker nightly reminder (with interactive buttons)\n"
-            ),
-            inline=False,
-        )
-
-        embed.add_field(
-            name="💾 Data Storage",
-            value=(
-                "**To-Do:** `to_do_list.pkl`, `recurring_tasks.pkl`\n"
-                "**Discipline:** `discipline_list.pkl`, `discipline_completion_log.pkl`\n"
+                f"`{command_prefix}weekly_discipline_summary` — Weekly progress report vs frequency targets\n"
+                f"`{command_prefix}daily_discipline_visual` — Post today's discipline goal-status visual to the discipline channel\n"
+                f"`{command_prefix}weekly_discipline_visual [week_start]` — Post weekly discipline progress visual to the discipline channel\n"
             ),
             inline=False,
         )
@@ -583,6 +781,8 @@ async def to_do_list(ctx):
 # This command outputs the To-Do List Summary at 12:45 AM EST daily
 async def send_daily_message():
     global last_discipline_daily_date
+    global last_todo_visual_date
+    global last_todo_weekly_visual_date
 
     est = pytz.timezone('US/Eastern')
     now = datetime.datetime.now(est)
@@ -707,6 +907,60 @@ async def send_daily_message():
                     print(f"Error sending discipline daily tracker: {e}")
             last_discipline_daily_date = now.date()
 
+    visual_trigger_total_minutes = (discipline_daily_hour * 60 + discipline_daily_minute + 15) % (24 * 60)
+    visual_trigger_hour, visual_trigger_minute = divmod(visual_trigger_total_minutes, 60)
+
+    if now.hour == visual_trigger_hour and now.minute == visual_trigger_minute:
+        if last_todo_visual_date != now.date():
+            to_do_list_channel = get_todo_channel()
+            if to_do_list_channel:
+                try:
+                    to_do_list_df = pd.read_pickle(path_for_to_do_list)
+                    completion_series = build_completed_task_series(to_do_list_df, end_date=now.date(), days=7)
+
+                    today_total = int(completion_series.iloc[-1]) if not completion_series.empty else 0
+                    week_total = int(completion_series.sum())
+                    avg_daily = round(float(completion_series.mean()), 1) if len(completion_series) > 0 else 0
+
+                    daily_subtitle = f"Today: {today_total} | Last 7 days: {week_total} | Avg/day: {avg_daily}"
+                    daily_chart = render_completed_task_bar_chart(
+                        completion_series=completion_series,
+                        chart_title="To-Do Completion Trend (7 Days)",
+                        subtitle=daily_subtitle,
+                        highlight_index=len(completion_series) - 1,
+                    )
+
+                    await to_do_list_channel.send(f"<@{user_id}>, 15-minute post check-in completion snapshot:")
+                    await to_do_list_channel.send(file=discord.File(fp=daily_chart, filename="todo_completion_7_day.png"))
+                except Exception as e:
+                    print(f"Error sending to-do completion trend chart: {e}")
+
+            last_todo_visual_date = now.date()
+
+        if now.weekday() == 6 and last_todo_weekly_visual_date != now.date():
+            to_do_list_channel = get_todo_channel()
+            if to_do_list_channel:
+                try:
+                    to_do_list_df = pd.read_pickle(path_for_to_do_list)
+                    weekly_series = build_completed_task_series(to_do_list_df, end_date=now.date(), days=7)
+                    weekly_total = int(weekly_series.sum())
+                    weekly_avg = round(float(weekly_series.mean()), 1) if len(weekly_series) > 0 else 0
+
+                    weekly_subtitle = f"Week total: {weekly_total} | Avg/day: {weekly_avg}"
+                    weekly_chart = render_completed_task_bar_chart(
+                        completion_series=weekly_series,
+                        chart_title="Sunday End-of-Week Report",
+                        subtitle=weekly_subtitle,
+                        highlight_index=None,
+                    )
+
+                    await to_do_list_channel.send(f"<@{user_id}>, End-of-week completion report:")
+                    await to_do_list_channel.send(file=discord.File(fp=weekly_chart, filename="todo_completion_end_of_week.png"))
+                except Exception as e:
+                    print(f"Error sending Sunday end-of-week chart: {e}")
+
+            last_todo_weekly_visual_date = now.date()
+
 
 
 
@@ -790,6 +1044,78 @@ async def create_task(ctx,
         await ctx.send("Added", delete_after=60)
     except Exception as e:
         await ctx.send(f"Something went wrong: {e}")
+
+
+@bot.command(name="to_do_completion_visual", help="Post a 7-day to-do completion bar chart to the to-do channel")
+async def to_do_completion_visual(ctx):
+    to_do_list_channel = get_todo_channel()
+    if not to_do_list_channel:
+        await ctx.send("To-do channel not found. Please verify Channel_ID_to_do in config.", delete_after=60)
+        return
+
+    try:
+        to_do_list_df = pd.read_pickle(path_for_to_do_list)
+        completion_series = build_completed_task_series(to_do_list_df, end_date=datetime.datetime.now().date(), days=7)
+
+        today_total = int(completion_series.iloc[-1]) if not completion_series.empty else 0
+        week_total = int(completion_series.sum())
+        avg_daily = round(float(completion_series.mean()), 1) if len(completion_series) > 0 else 0
+
+        subtitle = f"Today: {today_total} | Last 7 days: {week_total} | Avg/day: {avg_daily}"
+        chart = render_completed_task_bar_chart(
+            completion_series=completion_series,
+            chart_title="To-Do Completion Trend (7 Days)",
+            subtitle=subtitle,
+            highlight_index=len(completion_series) - 1,
+        )
+
+        await to_do_list_channel.send(f"<@{user_id}>, On-demand 7-day completion snapshot:")
+        await to_do_list_channel.send(file=discord.File(fp=chart, filename="todo_completion_7_day.png"))
+
+        if ctx.channel.id != to_do_list_channel.id:
+            await ctx.send("Posted the visual in the to-do channel.", delete_after=30)
+    except Exception as e:
+        await ctx.send(f"Could not generate to-do completion visual: {e}", delete_after=60)
+
+
+@bot.command(name="to_do_weekly_visual", help="Post an end-of-week to-do completion bar chart to the to-do channel")
+async def to_do_weekly_visual(ctx, week_end=None):
+    to_do_list_channel = get_todo_channel()
+    if not to_do_list_channel:
+        await ctx.send("To-do channel not found. Please verify Channel_ID_to_do in config.", delete_after=60)
+        return
+
+    if week_end in (None, ""):
+        end_date = pd.to_datetime(datetime.datetime.now().date()).normalize()
+    else:
+        try:
+            end_date = pd.to_datetime(week_end).normalize()
+        except Exception:
+            await ctx.send("Invalid week_end format. Use YYYYMMDD (e.g., 20260517).", delete_after=60)
+            return
+
+    try:
+        to_do_list_df = pd.read_pickle(path_for_to_do_list)
+        weekly_series = build_completed_task_series(to_do_list_df, end_date=end_date, days=7)
+
+        weekly_total = int(weekly_series.sum())
+        weekly_avg = round(float(weekly_series.mean()), 1) if len(weekly_series) > 0 else 0
+
+        subtitle = f"Week ending {pd.to_datetime(end_date).strftime('%m/%d/%Y')} | Total: {weekly_total} | Avg/day: {weekly_avg}"
+        chart = render_completed_task_bar_chart(
+            completion_series=weekly_series,
+            chart_title="To-Do End-of-Week Report",
+            subtitle=subtitle,
+            highlight_index=None,
+        )
+
+        await to_do_list_channel.send(f"<@{user_id}>, On-demand weekly completion report:")
+        await to_do_list_channel.send(file=discord.File(fp=chart, filename="todo_completion_end_of_week.png"))
+
+        if ctx.channel.id != to_do_list_channel.id:
+            await ctx.send("Posted the weekly visual in the to-do channel.", delete_after=30)
+    except Exception as e:
+        await ctx.send(f"Could not generate weekly to-do visual: {e}", delete_after=60)
 
 
 @bot.command(name = "create_discipline_task", help = "Create a task in the separate discipline tracker")
@@ -938,8 +1264,8 @@ async def today_completions(ctx, date=None):
     await ctx.send(embed=embed, delete_after=120)
 
 
-@bot.command(name = "weekly_discipline_report", help= "Weekly discipline progress vs frequency targets")
-async def weekly_discipline_report(ctx, week_start=None):
+@bot.command(name = "weekly_discipline_summary", help= "Weekly discipline progress vs frequency targets")
+async def weekly_discipline_summary(ctx, week_start=None):
     ensure_discipline_dataframe_exists()
     ensure_discipline_completion_log_exists()
 
@@ -1013,9 +1339,144 @@ async def weekly_discipline_report(ctx, week_start=None):
         count += 1
 
     embed.set_footer(
-        text=f"Overall: {total_actual}/{total_target} ({round(overall_percent, 1)}%) | Use {command_prefix}weekly_discipline_report YYYYMMDD"
+        text=f"Overall: {total_actual}/{total_target} ({round(overall_percent, 1)}%) | Use {command_prefix}weekly_discipline_summary YYYYMMDD"
     )
     await ctx.send(embed=embed, delete_after=180)
+
+
+@bot.command(name="daily_discipline_visual", aliases=["discipline_daily_visual"], help="Post today's discipline goal-status visual to the discipline channel")
+async def daily_discipline_visual(ctx):
+    ensure_discipline_dataframe_exists()
+    ensure_discipline_completion_log_exists()
+
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+
+    discipline_channel = get_discipline_channel()
+    if not discipline_channel:
+        await ctx.send("Discipline channel not found. Please verify Channel_ID_discipline in config.", delete_after=60)
+        return
+
+    discipline_df = pd.read_pickle(path_for_discipline_list)
+    if discipline_df.empty:
+        await ctx.send("No discipline tasks are currently tracked.", delete_after=60)
+        return
+
+    today = pd.to_datetime(datetime.datetime.now().date()).normalize()
+    week_start = today - pd.Timedelta(days=int(today.weekday()))
+    week_end = week_start + pd.Timedelta(days=6)
+
+    completion_df = pd.read_pickle(path_for_discipline_completion_log)
+    report_df = build_discipline_weekly_counts(discipline_df, completion_df, week_start, week_end)
+
+    # Build state flags to match the daily visual intent.
+    report_df["COMPLETED_TODAY"] = report_df["TASK"].apply(
+        lambda task: get_task_completed_today(task, normalize_discipline_completion_df(completion_df), today)
+    )
+
+    status_codes = []
+    goal_met_flags = []
+    reached_today_count = 0
+    goal_already_met_count = 0
+    done_today_not_met_count = 0
+    needs_completion_count = 0
+
+    for _, row in report_df.iterrows():
+        target = int(row["FREQUENCY_PER_WEEK"])
+        actual_now = int(row["COMPLETIONS_THIS_WEEK"])
+        actual_before_today = int(row["COMPLETIONS_BEFORE_END_DATE"])
+        completed_today = bool(row["COMPLETED_TODAY"])
+
+        if actual_now >= target:
+            goal_met_flags.append(1)
+            if completed_today and actual_before_today < target:
+                status_codes.append("met_today")
+                reached_today_count += 1
+            else:
+                status_codes.append("met_before_today")
+                goal_already_met_count += 1
+        else:
+            goal_met_flags.append(0)
+            if completed_today:
+                status_codes.append("done_today_not_met")
+                done_today_not_met_count += 1
+            else:
+                status_codes.append("needs_completion")
+                needs_completion_count += 1
+
+    report_df["STATUS_CODE"] = status_codes
+    report_df["GOAL_MET_BINARY"] = goal_met_flags
+
+    subtitle = (
+        f"Met Today: {reached_today_count} | Already Met: {goal_already_met_count} | "
+        f"Done Today: {done_today_not_met_count} | Need: {needs_completion_count}"
+    )
+    chart = render_discipline_daily_goal_status_chart(
+        status_df=report_df,
+        chart_title=f"Discipline Daily Goal Status ({today.strftime('%m/%d/%Y')})",
+        subtitle=subtitle,
+    )
+
+    await discipline_channel.send(f"<@{user_id}>, On-demand discipline daily visual:", delete_after=300)
+    await discipline_channel.send(file=discord.File(fp=chart, filename="discipline_daily_goal_status.png"), delete_after=300)
+
+    if ctx.channel.id != discipline_channel.id:
+        await ctx.send("Posted the discipline daily visual in the discipline channel.", delete_after=300)
+
+
+@bot.command(name="weekly_discipline_visual", aliases=["discipline_weekly_visual", "weekly_discipline_report"], help="Post weekly discipline progress visual to the discipline channel")
+async def weekly_discipline_visual(ctx, week_start=None):
+    ensure_discipline_dataframe_exists()
+    ensure_discipline_completion_log_exists()
+
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+
+    discipline_channel = get_discipline_channel()
+    if not discipline_channel:
+        await ctx.send("Discipline channel not found. Please verify Channel_ID_discipline in config.", delete_after=60)
+        return
+
+    discipline_df = pd.read_pickle(path_for_discipline_list)
+    if discipline_df.empty:
+        await ctx.send("No discipline tasks are currently tracked.", delete_after=60)
+        return
+
+    today = pd.to_datetime(datetime.datetime.now().date()).normalize()
+    if week_start in (None, ""):
+        start_date = today - pd.Timedelta(days=int(today.weekday()))
+    else:
+        try:
+            parsed_start = pd.to_datetime(week_start).normalize()
+            start_date = parsed_start - pd.Timedelta(days=int(parsed_start.weekday()))
+        except Exception:
+            await ctx.send("Invalid week_start format. Use YYYYMMDD (e.g., 20260511).", delete_after=60)
+            return
+
+    end_date = start_date + pd.Timedelta(days=6)
+    completion_df = pd.read_pickle(path_for_discipline_completion_log)
+    report_df = build_discipline_weekly_counts(discipline_df, completion_df, start_date, end_date)
+
+    total_target = int(report_df["FREQUENCY_PER_WEEK"].sum())
+    total_actual = int(report_df["COMPLETIONS_THIS_WEEK"].sum())
+    completion_rate = round((min(total_actual / total_target, 1) * 100) if total_target > 0 else 0, 1)
+
+    subtitle = f"Week {start_date.strftime('%m/%d')} - {end_date.strftime('%m/%d')} | Total: {total_actual}/{total_target} | Goal Hit: {completion_rate}%"
+    chart = render_discipline_weekly_progress_chart(
+        report_df=report_df,
+        chart_title="Discipline Weekly Progress (Actual vs Target)",
+        subtitle=subtitle,
+    )
+
+    await discipline_channel.send(f"<@{user_id}>, On-demand discipline weekly visual:", delete_after=300)
+    await discipline_channel.send(file=discord.File(fp=chart, filename="discipline_weekly_progress.png"), delete_after=300)
+
+    if ctx.channel.id != discipline_channel.id:
+        await ctx.send("Posted the discipline weekly visual in the discipline channel.", delete_after=300)
 
 
 #%%
