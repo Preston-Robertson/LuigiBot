@@ -1,168 +1,163 @@
-# LuigiBot 🤖
+# LuigiBot
 
-A personal Discord bot for managing your to-do list directly from a Discord channel. Create tasks, track their progress, log hours, and get a daily morning summary — all without leaving Discord.
-
----
+A personal Discord bot for managing a to-do list and a separate discipline tracker directly from Discord.
 
 ## Features
 
-- **Create tasks** with rich metadata: category, group, subgroup, priority, due date, estimated time, and relevant links
-- **View your to-do list** as a formatted embed, sorted by priority and due date
-- **Interact with tasks via emoji reactions** — start, pause, or complete tasks with a single click
-- **Automatic time tracking** — logs hours when you start (▶️) and pause (⏸️) a task
-- **Recurring tasks** — define tasks that re-appear automatically after a set number of days
-- **Daily morning summary** — posts your active to-do list to a designated channel every day at 8:00 AM EST
-
----
+- Create and manage to-do tasks with metadata (category, group, due date, priority, links, recurring cadence)
+- View active tasks in a numbered embed and use buttons to start, pause, or complete tasks
+- Track logged time as tasks move through statuses
+- Auto re-add recurring tasks each morning when due
+- Send daily to-do summaries and completed-task recaps
+- Maintain a separate discipline tracker dataframe and completion log
+- Send a nightly discipline check-in with numbered buttons for quick logging
 
 ## Project Structure
 
-```
+```text
 LuigiBot/
-├── luigi_bot_main.py      # Main bot logic: commands, events, scheduled tasks
-├── required_functions.py  # Helper functions (e.g. task name extraction)
-├── requirements.txt       # Python dependencies
-├── config.json            # Bot configuration (not committed — see setup)
-└── to_do_list/
-    ├── to_do_list.pkl     # Persistent task storage
-    └── recurring_tasks.pkl
+|-- main.py
+|-- required_functions.py
+|-- requirements.txt
+|-- config.json
+`-- to_do_list/
+    |-- to_do_list.pkl
+    |-- recurring_tasks.pkl
+    |-- discipline_list.pkl
+    `-- discipline_completion_log.pkl
 ```
-
----
 
 ## Prerequisites
 
 - Python 3.9+
-- A Discord bot token ([Discord Developer Portal](https://discord.com/developers/applications))
-- The bot must have the following permissions in your server:
+- A Discord bot token from the Discord Developer Portal
+- Bot permissions:
   - Send Messages
   - Read Message History
-  - Add Reactions
-  - Manage Messages (to delete processed messages)
   - Embed Links
-
----
+  - Use Application Commands
 
 ## Setup
 
-**1. Clone the repository**
-
-```bash
-git clone https://github.com/Leogi-ex/LuigiBot.git
-cd LuigiBot
-```
-
-**2. Install dependencies**
+1. Install dependencies.
 
 ```bash
 pip install -r requirements.txt
 ```
 
-**3. Create `config.json`**
-
-Create a `config.json` file in the root directory with the following structure:
+2. Create `config.json` in the project root.
 
 ```json
 {
+  "APPLICATION_ID": 123456789012345678,
+  "PUBLIC_KEY": "your-public-key",
   "TOKEN": "your-discord-bot-token",
   "Channel_ID": 123456789012345678,
   "Channel_ID_to_do": 123456789012345678,
+  "Channel_ID_discipline": 123456789012345678,
+  "Discipline_List_Path": "to_do_list\\discipline_list.pkl",
+  "Discipline_Completion_Log_Path": "to_do_list\\discipline_completion_log.pkl",
+  "Discipline_Delete_After_Seconds": 7200,
+  "Discipline_Daily_Hour": 23,
+  "Discipline_Daily_Minute": 15,
   "User_ID": 123456789012345678
 }
 ```
 
-| Key | Description |
-|-----|-------------|
-| `TOKEN` | Your Discord bot token |
-| `Channel_ID` | The default channel the bot posts to |
-| `Channel_ID_to_do` | The channel used for to-do list messages |
-| `User_ID` | Your Discord user ID (for daily summary mentions) |
-
-**4. Initialize the data directory**
-
-Create the task storage directory before running:
+3. Ensure the data folder exists.
 
 ```bash
 mkdir to_do_list
 ```
 
-**5. Run the bot**
+4. Run the bot.
 
 ```bash
-python luigi_bot_main.py
+python main.py
 ```
 
----
+## Command Activation
+
+- Prefix commands use `!L `.
+- To-do commands are hybrid and can be run as slash or prefix commands.
+- Discipline commands are prefix-only to reduce slash command clutter.
 
 ## Commands
 
-### `/hello`
-A simple test command. The bot greets you by mention.
+### To-Do Commands
 
----
+- `/hello`
+- `/to_do_list` or `!L to_do_list`
+- `/create_task` or `!L create_task`
 
-### `/to_do_list` (or `!L to_do_list`)
-Displays your current (non-completed) tasks as a numbered embed, sorted by priority then due date. React with a number emoji (1️⃣–9️⃣) to expand details on that task.
+### Discipline Commands (Prefix Only)
 
----
+- `!L create_discipline_task <task_name> <catagory> <frequency_per_week>`
+- `!L discipline_list`
+- `!L log_discipline_completion <task_name> [completed_date]`
+- `!L today_completions [date]`
+- `!L weekly_discipline_report [week_start]`
 
-### `/create_task` (or `!L create_task`)
-Creates a new task and adds it to your to-do list.
+`completed_date` / `date` / `week_start` format: `YYYYMMDD` (for example, `20260512`).
 
-| Parameter | Required | Description |
-|-----------|----------|-------------|
-| `task_name` | ✅ | Name of the task |
-| `catagory` | ✅ | Category (e.g. "Work", "Personal") |
-| `group` | ➖ | High-level objective the task belongs to |
-| `subgroup` | ➖ | Sub-group within the group |
-| `relevant_link` | ➖ | A URL related to the task |
-| `recurring` | ➖ | `True` if this task repeats (default: `False`) |
-| `recurring_interval` | ➖ | How many days between recurrences (required if `recurring=True`) |
-| `due_date` | ➖ | Due date — accepts `YYYYMMDD`, `today`/`td`, `tomorrow`/`tmw`, or `week`/`wk` |
-| `priority` | ➖ | Priority 1–10 (10 = urgent, default: 1) |
-| `estimated_time` | ➖ | Estimated hours of active work |
+## Quick Start Examples
 
----
+Use these as copy/paste examples once the bot is running.
 
-## Emoji Reactions
+```text
+# To-do (hybrid commands)
+/to_do_list
+!L to_do_list
 
-When a task embed is displayed, you can react to control it:
+/create_task task_name:Gym catagory:Health priority:7 due_date:today
+!L create_task Gym Health None None None False None today 7 1.5
 
-| Emoji | Action |
-|-------|--------|
-| Number (1️⃣–9️⃣) | Expand full details for that task |
-| ▶️ | Mark task as **In Progress** and start the timer |
-| ⏸️ | Pause the task (**Hiatus**) and log elapsed hours |
-| ✅ | Mark task as **Completed** and finalize logged hours |
+# Discipline (prefix-only commands)
+!L create_discipline_task "Deep Work" Focus 5
+!L discipline_list
+!L log_discipline_completion "Deep Work"
+!L today_completions
+!L today_completions 20260512
+!L weekly_discipline_report
+!L weekly_discipline_report 20260512
+```
 
----
+Tips:
 
-## Daily Summary
+- For prefix commands, wrap multi-word task names in double quotes.
+- If you skip a date for `today_completions`, LuigiBot uses today.
 
-Every day at **8:00 AM EST**, LuigiBot automatically posts a summary of all active tasks to the configured to-do channel and pings you. At **7:45 AM EST**, it checks whether any recurring tasks are due to be re-added to the list.
+## Task Interaction
 
----
+When you run the to-do list command, LuigiBot shows numbered task buttons. Selecting a task opens action buttons:
 
-## Task Statuses
+- Complete
+- Start
+- Pause
 
-Tasks move through the following states:
+## Scheduled Events (ET)
 
-`Not Started` → `In Progress` → `Hiatus` → `Completed`
+- 7:45 AM: Check and re-add due recurring to-do tasks
+- 8:00 AM: Daily active to-do summary
+- 11:00 PM: Tasks completed today summary
+- 11:15 PM: Discipline nightly reminder with numbered completion buttons
 
-Other possible statuses: `Pending`, `Blocked`
+## Discipline Data Model
 
----
+Discipline active list (`discipline_list.pkl`):
 
-## Dependencies
+- `TASK`
+- `CATAGORY`
+- `FREQUENCY_PER_WEEK`
 
-See `requirements.txt`. Key libraries:
+Discipline completion log (`discipline_completion_log.pkl`):
 
-- [`discord.py`](https://discordpy.readthedocs.io/) — Discord bot framework
-- `pandas` — Task data storage and manipulation
-- `pytz` — Timezone handling for scheduled messages
+- `TASK`
+- `CATAGORY`
+- `COMPLETED_DATE`
+- `LOGGED_AT`
 
----
+## Notes
 
-## License
-
-This project does not currently specify a license. All rights reserved by the author.
+- Nightly discipline reminders auto-delete after `Discipline_Delete_After_Seconds`.
+- Startup message includes command activation details so usage is visible at boot.
