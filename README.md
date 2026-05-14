@@ -5,11 +5,12 @@ A personal Discord bot for managing a to-do list and a separate discipline track
 ## Features
 
 - Create and manage to-do tasks with metadata (category, group, due date, priority, links, recurring cadence)
-- View active tasks in a numbered embed and use buttons to start, pause, or complete tasks
+- View active tasks in a numbered embed and use buttons to start, pause, complete, snooze for 1 hour, move to tomorrow, or push to the weekend
 - Track logged time as tasks move through statuses
 - Auto re-add recurring tasks each morning when due
 - Send daily to-do summaries and completed-task recaps
 - Maintain a separate discipline tracker dataframe and completion log
+- Surface discipline streaks, best streaks, 4-week consistency scores, and missed-target alerts
 - Send a nightly discipline check-in with numbered buttons for quick logging
 
 ## Project Structure
@@ -97,6 +98,7 @@ python main.py
 - `!L log_discipline_completion <task_name> [completed_date]`
 - `!L today_completions [date]`
 - `!L weekly_discipline_report [week_start]`
+- `!L discipline_streaks`
 
 `completed_date` / `date` / `week_start` format: `YYYYMMDD` (for example, `20260512`).
 
