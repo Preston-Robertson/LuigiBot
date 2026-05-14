@@ -302,6 +302,216 @@ def build_discipline_weekly_counts(discipline_df, completion_df, start_date, end
     return report_df.sort_values(by=["FREQUENCY_PER_WEEK", "TASK"], ascending=[False, True])
 
 
+def calculate_streak_metrics(completion_dates, reference_date):
+    normalized_dates = sorted(
+        {
+            pd.to_datetime(date_value).normalize()
+            for date_value in completion_dates
+            if not pd.isna(date_value)
+        }
+    )
+
+    if not normalized_dates:
+        return 0, 0
+
+    longest_streak = 1
+    running_streak = 1
+    for current_date, next_date in zip(normalized_dates, normalized_dates[1:]):
+        if next_date - current_date == pd.Timedelta(days=1):
+            running_streak += 1
+        else:
+            longest_streak = max(longest_streak, running_streak)
+            running_streak = 1
+
+    longest_streak = max(longest_streak, running_streak)
+
+    current_streak = 0
+    reference_day = pd.to_datetime(reference_date).normalize()
+    date_set = set(normalized_dates)
+    cursor = reference_day
+    while cursor in date_set:
+        current_streak += 1
+        cursor -= pd.Timedelta(days=1)
+
+    return current_streak, longest_streak
+
+
+def calculate_consistency_score(completion_dates, frequency_per_week, reference_date, lookback_days=28):
+    target_per_week = max(1, min(int(frequency_per_week), 7))
+    window_end = pd.to_datetime(reference_date).normalize()
+    window_start = window_end - pd.Timedelta(days=lookback_days - 1)
+
+    normalized_dates = {
+        pd.to_datetime(date_value).normalize()
+        for date_value in completion_dates
+        if not pd.isna(date_value)
+    }
+    actual_count = sum(1 for date_value in normalized_dates if window_start <= date_value <= window_end)
+
+    expected_count = max((target_per_week / 7) * lookback_days, 1)
+    return round(min(actual_count / expected_count, 1) * 100, 1)
+
+
+def build_discipline_insight_df(discipline_df, completion_df, start_date, end_date, reference_date=None):
+    reference_day = pd.to_datetime(reference_date if reference_date is not None else end_date).normalize()
+    normalized_completion_df = normalize_discipline_completion_df(completion_df)
+    report_df = build_discipline_weekly_counts(discipline_df, normalized_completion_df, start_date, end_date).copy()
+
+    if normalized_completion_df.empty:
+        report_df["CURRENT_STREAK"] = 0
+        report_df["LONGEST_STREAK"] = 0
+        report_df["CONSISTENCY_SCORE"] = 0.0
+        report_df["COMPLETED_TODAY"] = False
+    else:
+        completion_dates_by_task = (
+            normalized_completion_df.groupby("TASK")["COMPLETED_DATE"].apply(list).to_dict()
+        )
+        report_df["CURRENT_STREAK"] = report_df["TASK"].map(
+            lambda task_name: calculate_streak_metrics(
+                completion_dates_by_task.get(str(task_name).strip(), []),
+                reference_day,
+            )[0]
+        )
+        report_df["LONGEST_STREAK"] = report_df["TASK"].map(
+            lambda task_name: calculate_streak_metrics(
+                completion_dates_by_task.get(str(task_name).strip(), []),
+                reference_day,
+            )[1]
+        )
+        report_df["CONSISTENCY_SCORE"] = report_df.apply(
+            lambda row: calculate_consistency_score(
+                completion_dates_by_task.get(str(row["TASK"]).strip(), []),
+                row["FREQUENCY_PER_WEEK"],
+                reference_day,
+            ),
+            axis=1,
+        )
+        report_df["COMPLETED_TODAY"] = report_df["TASK"].apply(
+            lambda task_name: get_task_completed_today(task_name, normalized_completion_df, reference_day)
+        )
+
+    report_df["REMAINING_THIS_WEEK"] = (
+        report_df["FREQUENCY_PER_WEEK"] - report_df["COMPLETIONS_THIS_WEEK"]
+    ).clip(lower=0)
+
+    if reference_day > pd.to_datetime(end_date).normalize():
+        available_days = 0
+    else:
+        days_remaining_including_today = (pd.to_datetime(end_date).normalize() - reference_day).days + 1
+        available_days = days_remaining_including_today - report_df["COMPLETED_TODAY"].astype(int)
+        available_days = available_days.clip(lower=0)
+
+    report_df["AVAILABLE_DAYS_LEFT"] = available_days
+    report_df["AT_RISK_THIS_WEEK"] = report_df["REMAINING_THIS_WEEK"] > report_df["AVAILABLE_DAYS_LEFT"]
+    report_df["MISSED_TARGET"] = report_df["COMPLETIONS_THIS_WEEK"] < report_df["FREQUENCY_PER_WEEK"]
+
+    return report_df
+
+
+def build_discipline_alert_summary(report_df, for_current_week=True):
+    if report_df.empty:
+        return ""
+
+    if for_current_week:
+        flagged_df = report_df[report_df["AT_RISK_THIS_WEEK"]]
+        prefix = "At risk this week"
+    else:
+        flagged_df = report_df[report_df["MISSED_TARGET"]]
+        prefix = "Missed target"
+
+    if flagged_df.empty:
+        return "No missed-target alerts."
+
+    task_names = flagged_df["TASK"].astype(str).tolist()
+    preview = ", ".join(task_names[:4])
+    suffix = "..." if len(task_names) > 4 else ""
+    return f"{prefix}: {preview}{suffix}"
+
+
+def format_task_due_value(due_value):
+    parsed_due = pd.to_datetime(due_value, errors="coerce")
+    if pd.isna(parsed_due):
+        return "No due date"
+    return parsed_due.strftime("%m/%d/%Y %I:%M %p") if parsed_due.time() != datetime.time.min else parsed_due.strftime("%m/%d/%Y")
+
+
+def build_task_detail_embed(row):
+    embed = discord.Embed(title=str(row["TASK"]), color=0x00FF00)
+    priority = row["PRIORITY"]
+    task_creation = row["TASK CREATION"]
+    task_completion = row.get("COMPLETED TIME")
+    catagory = row.get("CATAGORY")
+    group = row.get("GROUP")
+    subgroup = row.get("SUB-GROUP")
+    starttime = row.get("START TIME")
+    estimated_time = row.get("ESTIMATED TIME")
+    logged_hours = row.get("LOGGED HOURS")
+    status = row["STATUS"]
+    due = format_task_due_value(row.get("DUE DATE"))
+    link = row.get("RELEVANT LINK")
+    link_md = f"[LINK]({link})" if link and str(link) not in ("None", "nan") else "No link"
+
+    lines = [
+        f"Priority: {priority}",
+        f"Due: {due}",
+    ]
+
+    if catagory is not None:
+        lines.append(f"Category: {catagory}")
+    if group is not None:
+        lines.append(f"Group: {group}")
+    lines.extend(
+        [
+            f"Subgroup: {subgroup}",
+            f"Start Time: {starttime}",
+            f"Estimated Time: {estimated_time}",
+            f"Logged Hours: {logged_hours}",
+            f"Task Created: {task_creation}",
+        ]
+    )
+    if not pd.isna(pd.to_datetime(task_completion, errors="coerce")):
+        lines.append(f"Task Completed: {task_completion}")
+    lines.append(link_md)
+
+    embed.add_field(name=status, value="\n".join(lines), inline=False)
+    return embed
+
+
+def get_open_task_mask(to_do_list_df, task_name):
+    return (to_do_list_df["TASK"] == task_name) & (to_do_list_df["STATUS"] != "Completed")
+
+
+def load_latest_task_row(task_name):
+    to_do_list_df = pd.read_pickle(path_for_to_do_list)
+    task_df = to_do_list_df[to_do_list_df["TASK"] == task_name].copy()
+    if task_df.empty:
+        return None
+
+    task_df["COMPLETED TIME SORT"] = pd.to_datetime(task_df["COMPLETED TIME"], errors="coerce")
+    task_df["TASK CREATION SORT"] = pd.to_datetime(task_df["TASK CREATION"], errors="coerce")
+    task_df = task_df.sort_values(by=["COMPLETED TIME SORT", "TASK CREATION SORT"], ascending=[False, False])
+    return task_df.iloc[0]
+
+
+def pause_task_tracking(to_do_list_df, task_mask, now_timestamp):
+    if task_mask.sum() == 0:
+        return False
+
+    current_status = str(to_do_list_df.loc[task_mask, "STATUS"].iloc[0])
+    if current_status != "In Progress":
+        return False
+
+    start_time = pd.to_datetime(to_do_list_df.loc[task_mask, "START TIME"].iloc[0], errors="coerce")
+    if pd.isna(start_time):
+        return False
+
+    existing_hours = pd.to_numeric(to_do_list_df.loc[task_mask, "LOGGED HOURS"], errors="coerce").fillna(0)
+    additional_hours = round((now_timestamp - start_time).total_seconds() / 3600, 3)
+    to_do_list_df.loc[task_mask, "LOGGED HOURS"] = existing_hours + additional_hours
+    to_do_list_df.loc[task_mask, "START TIME"] = pd.NaT
+    return True
+
+
 def render_discipline_daily_goal_status_chart(status_df, chart_title, subtitle=None):
     labels = status_df["TASK"].astype(str).tolist()
     values = status_df["GOAL_MET_BINARY"].astype(int).tolist()
@@ -464,6 +674,25 @@ def build_discipline_daily_embed(discipline_df, completion_log_df, now_est):
 
     pending_count = len(pending_tasks)
     logged_count = len(logged_tasks)
+
+    week_start = today - pd.Timedelta(days=int(today.weekday()))
+    week_end = week_start + pd.Timedelta(days=6)
+    insight_df = build_discipline_insight_df(discipline_df, completion_log_df, week_start, week_end, reference_date=today)
+    streak_leader_df = insight_df.sort_values(by=["CURRENT_STREAK", "LONGEST_STREAK", "TASK"], ascending=[False, False, True])
+    if not streak_leader_df.empty and int(streak_leader_df.iloc[0]["CURRENT_STREAK"]) > 0:
+        leader = streak_leader_df.iloc[0]
+        embed.add_field(
+            name="Streak Leader",
+            value=(
+                f"{leader['TASK']}\n"
+                f"Current: {int(leader['CURRENT_STREAK'])} day(s)\n"
+                f"Best: {int(leader['LONGEST_STREAK'])} day(s)"
+            ),
+            inline=False,
+        )
+
+    alert_summary = build_discipline_alert_summary(insight_df, for_current_week=True)
+    embed.add_field(name="Weekly Alert", value=alert_summary, inline=False)
     embed.set_footer(text=f"Pending: {pending_count} | Logged: {logged_count} | Use {command_prefix}log_discipline_completion to log")
 
     return embed
@@ -512,93 +741,106 @@ class TaskSelectView(discord.ui.View):
 
 
 class TaskActionView(discord.ui.View):
-    """Buttons to Complete, Start, or Pause a task."""
+    """Buttons to Complete, Start, Pause, or defer a task."""
     def __init__(self, task_name):
         super().__init__(timeout=None)
         self.task_name = task_name
 
-    @discord.ui.button(label="Complete", style=discord.ButtonStyle.success, emoji="✅")
-    async def complete_task(self, interaction: discord.Interaction, button: discord.ui.Button):
-        task_name = self.task_name
-        to_do_list_df = pd.read_pickle(path_for_to_do_list)
-        the_filter = (to_do_list_df["TASK"] == task_name) & (to_do_list_df["STATUS"] != "Completed")
+    async def _persist_and_ack(self, interaction, to_do_list_df, message):
+        to_do_list_df.to_pickle(path_for_to_do_list)
+        await interaction.response.edit_message(content=message, embed=None, view=None)
+        msg = await interaction.original_response()
+        await msg.delete(delay=30)
 
-        try:
-            filtered_df = to_do_list_df[the_filter]
-        except Exception as e:
-            await interaction.response.send_message(f"Something went wrong: {e}", ephemeral=True)
+    async def _load_open_task_df(self, interaction):
+        to_do_list_df = pd.read_pickle(path_for_to_do_list)
+        task_mask = get_open_task_mask(to_do_list_df, self.task_name)
+        if task_mask.sum() == 0:
+            await interaction.response.send_message("Task no longer exists or is already completed.", ephemeral=True)
+            return None, None
+        return to_do_list_df, task_mask
+
+    async def _defer_task(self, interaction, due_date, label):
+        to_do_list_df, task_mask = await self._load_open_task_df(interaction)
+        if to_do_list_df is None:
             return
 
-        to_do_list_df.loc[the_filter, "COMPLETED TIME"] = pd.to_datetime(datetime.datetime.now().isoformat(' ', 'seconds'))
-        if pd.isna(to_do_list_df.loc[the_filter]["LOGGED HOURS"].iloc[0]) == False:
-            time_delta = filtered_df["COMPLETED TIME"] - filtered_df["START TIME"] + pd.Timedelta(hours=filtered_df["LOGGED HOURS"].iloc[0])
-            to_do_list_df.loc[the_filter, "LOGGED HOURS"].iloc[0] = time_delta
-        else:
-            time_delta = filtered_df["COMPLETED TIME"] - filtered_df["START TIME"]
-            to_do_list_df.loc[the_filter, "LOGGED HOURS"].iloc[0] = time_delta
+        now_timestamp = pd.to_datetime(datetime.datetime.now().isoformat(' ', 'seconds'))
+        pause_task_tracking(to_do_list_df, task_mask, now_timestamp)
+        to_do_list_df.loc[task_mask, "DUE DATE"] = pd.to_datetime(due_date)
+        to_do_list_df.loc[task_mask, "STATUS"] = "Pending"
+        await self._persist_and_ack(
+            interaction,
+            to_do_list_df,
+            f"Deferred '{self.task_name}' to {label}.",
+        )
 
-        to_do_list_df.loc[the_filter, "STATUS"] = "Completed"
+    @discord.ui.button(label="Complete", style=discord.ButtonStyle.success, emoji="✅")
+    async def complete_task(self, interaction: discord.Interaction, button: discord.ui.Button):
+        to_do_list_df, task_mask = await self._load_open_task_df(interaction)
+        if to_do_list_df is None:
+            return
+
+        completion_timestamp = pd.to_datetime(datetime.datetime.now().isoformat(' ', 'seconds'))
+        pause_task_tracking(to_do_list_df, task_mask, completion_timestamp)
+        to_do_list_df.loc[task_mask, "COMPLETED TIME"] = completion_timestamp
+        to_do_list_df.loc[task_mask, "STATUS"] = "Completed"
         to_do_list_df.to_pickle(path_for_to_do_list)
 
         try:
-            to_do_list_df = pd.read_pickle(path_for_to_do_list)
-            task_df = to_do_list_df[to_do_list_df["TASK"] == task_name].sort_values(by=["COMPLETED TIME"], ascending=[False])
+            task_row = load_latest_task_row(self.task_name)
+            if task_row is None:
+                await interaction.response.send_message(f"Task '{self.task_name}' could not be reloaded after completion.", ephemeral=True)
+                return
 
-            for _, row in task_df.astype(str).iterrows():
-                embed = discord.Embed(title=row["TASK"], color=0x00FF00)
-                priority = row["PRIORITY"]
-                task_creation = row["TASK CREATION"]
-                task_completion = row["COMPLETED TIME"]
-                catagory = row["CATAGORY"]
-                group = row["GROUP"]
-                subgroup = row["SUB-GROUP"]
-                starttime = row["START TIME"]
-                estimated_time = row["ESTIMATED TIME"]
-                logged_hours = row["LOGGED HOURS"]
-                status = row["STATUS"]
-                due = row["DUE DATE"] if row["DUE DATE"] != "NaT" else "No due date"
-                link = row["RELEVANT LINK"]
-                link_md = f"[LINK]({link})" if link and link not in ("None", "nan") else "No link"
-                value = f"""Priority: {priority}\nDue: {due}\n Category: {catagory}\nGroup: {group}\nSubgroup: {subgroup}\nStart Time: {starttime}\nEstimated Time: {estimated_time}\nLogged Hours: {logged_hours}\nTask Created: {task_creation}\nTask Completed: {task_completion}\n{link_md}\n"""
-                embed.add_field(name=status, value=value, inline=False)
+            embed = build_task_detail_embed(task_row)
 
             await interaction.response.edit_message(embed=embed, view=None)
             msg = await interaction.original_response()
             await msg.delete(delay=60)
 
         except Exception as e:
-            await interaction.response.send_message(f"Error completing task '{task_name}': {e}", ephemeral=True)
+            await interaction.response.send_message(f"Error completing task '{self.task_name}': {e}", ephemeral=True)
 
     @discord.ui.button(label="Start", style=discord.ButtonStyle.primary, emoji="▶️")
     async def start_task(self, interaction: discord.Interaction, button: discord.ui.Button):
-        task_name = self.task_name
-        to_do_list_df = pd.read_pickle(path_for_to_do_list)
-        the_filter = (to_do_list_df["TASK"] == task_name) & (to_do_list_df["STATUS"] != "Completed")
+        to_do_list_df, task_mask = await self._load_open_task_df(interaction)
+        if to_do_list_df is None:
+            return
 
-        to_do_list_df.loc[the_filter, "START TIME"] = pd.to_datetime(datetime.datetime.now().isoformat(' ', 'seconds'))
-        to_do_list_df.loc[the_filter, "STATUS"] = "In Progress"
-        to_do_list_df.to_pickle(path_for_to_do_list)
-        await interaction.response.edit_message(content=f"Updated '{task_name}' to 'In Progress'", embed=None, view=None)
-        msg = await interaction.original_response()
-        await msg.delete(delay=30)
+        to_do_list_df.loc[task_mask, "START TIME"] = pd.to_datetime(datetime.datetime.now().isoformat(' ', 'seconds'))
+        to_do_list_df.loc[task_mask, "STATUS"] = "In Progress"
+        await self._persist_and_ack(interaction, to_do_list_df, f"Updated '{self.task_name}' to 'In Progress'")
 
     @discord.ui.button(label="Pause", style=discord.ButtonStyle.secondary, emoji="⏸️")
     async def pause_task(self, interaction: discord.Interaction, button: discord.ui.Button):
-        task_name = self.task_name
-        to_do_list_df = pd.read_pickle(path_for_to_do_list)
-        the_filter = (to_do_list_df["TASK"] == task_name) & (to_do_list_df["STATUS"] != "Completed")
+        to_do_list_df, task_mask = await self._load_open_task_df(interaction)
+        if to_do_list_df is None:
+            return
 
-        if to_do_list_df.loc[the_filter, "STATUS"].iloc[0] == 'In Progress':
-            now = datetime.datetime.now()
-            start = to_do_list_df.loc[the_filter, "START TIME"].iloc[0]
-            logged_hours = round((now - start).total_seconds() / 3600, 3)
-            to_do_list_df.loc[the_filter, "LOGGED HOURS"] = to_do_list_df.loc[the_filter, "LOGGED HOURS"] + logged_hours
+        now_timestamp = pd.to_datetime(datetime.datetime.now().isoformat(' ', 'seconds'))
+        pause_task_tracking(to_do_list_df, task_mask, now_timestamp)
+        to_do_list_df.loc[task_mask, "STATUS"] = "Hiatus"
+        await self._persist_and_ack(interaction, to_do_list_df, f"Updated '{self.task_name}' to 'Hiatus'")
 
-        to_do_list_df.loc[the_filter, "STATUS"] = "Hiatus"
-        to_do_list_df.to_pickle(path_for_to_do_list)
-        await interaction.response.edit_message(content=f"Updated '{task_name}' to 'Hiatus'", embed=None, view=None)
-        msg = await interaction.original_response()
-        await msg.delete(delay=30)
+    @discord.ui.button(label="Snooze 1h", style=discord.ButtonStyle.secondary, emoji="⏰")
+    async def snooze_task(self, interaction: discord.Interaction, button: discord.ui.Button):
+        due_date = datetime.datetime.now() + datetime.timedelta(hours=1)
+        await self._defer_task(interaction, due_date, "in 1 hour")
+
+    @discord.ui.button(label="Tomorrow", style=discord.ButtonStyle.secondary, emoji="📅")
+    async def move_to_tomorrow(self, interaction: discord.Interaction, button: discord.ui.Button):
+        tomorrow = datetime.datetime.now().date() + datetime.timedelta(days=1)
+        await self._defer_task(interaction, tomorrow, "tomorrow")
+
+    @discord.ui.button(label="Weekend", style=discord.ButtonStyle.secondary, emoji="🗓️", row=1)
+    async def move_to_weekend(self, interaction: discord.Interaction, button: discord.ui.Button):
+        today = datetime.datetime.now().date()
+        days_until_saturday = (5 - today.weekday()) % 7
+        if days_until_saturday == 0:
+            days_until_saturday = 7
+        weekend_date = today + datetime.timedelta(days=days_until_saturday)
+        await self._defer_task(interaction, weekend_date, f"the weekend ({weekend_date.strftime('%m/%d')})")
 
 
 # --- Discipline Tracker Button Views ---
@@ -711,6 +953,7 @@ async def on_ready():
                 f"`{command_prefix}log_discipline_completion` — Log completion of a discipline task (for data collection)\n"
                 f"`{command_prefix}today_completions` — View today's logged discipline completions (or any date)\n"
                 f"`{command_prefix}weekly_discipline_summary` — Weekly progress report vs frequency targets\n"
+                f"`{command_prefix}discipline_streaks` — Current streaks, best streaks, and 4-week consistency scores\n"
                 f"`{command_prefix}daily_discipline_visual` — Post today's discipline goal-status visual to the discipline channel\n"
                 f"`{command_prefix}weekly_discipline_visual [week_start]` — Post weekly discipline progress visual to the discipline channel\n"
             ),
@@ -1288,38 +1531,22 @@ async def weekly_discipline_summary(ctx, week_start=None):
     end_date = start_date + pd.Timedelta(days=6)
 
     completion_df = pd.read_pickle(path_for_discipline_completion_log)
-    if completion_df.empty:
-        weekly_df = completion_df
-    else:
-        completion_df = completion_df.copy()
-        completion_df["COMPLETED_DATE"] = pd.to_datetime(completion_df["COMPLETED_DATE"]).dt.normalize()
-        weekly_df = completion_df[
-            (completion_df["COMPLETED_DATE"] >= start_date)
-            & (completion_df["COMPLETED_DATE"] <= end_date)
-        ]
-
-    # Count unique completion days per task so duplicate logs on one day do not inflate progress.
-    weekly_counts = {}
-    if not weekly_df.empty:
-        weekly_counts = weekly_df.groupby("TASK")["COMPLETED_DATE"].nunique().to_dict()
-
-    report_df = discipline_df.copy()
-    report_df["TASK"] = report_df["TASK"].astype(str)
-    report_df["FREQUENCY_PER_WEEK"] = pd.to_numeric(report_df["FREQUENCY_PER_WEEK"], errors="coerce").fillna(1).astype(int)
-    report_df["FREQUENCY_PER_WEEK"] = report_df["FREQUENCY_PER_WEEK"].clip(lower=1, upper=7)
-    report_df["COMPLETIONS_THIS_WEEK"] = report_df["TASK"].map(weekly_counts).fillna(0).astype(int)
+    reference_day = min(today, end_date)
+    report_df = build_discipline_insight_df(discipline_df, completion_df, start_date, end_date, reference_date=reference_day)
 
     total_target = int(report_df["FREQUENCY_PER_WEEK"].sum())
     total_actual = int(report_df["COMPLETIONS_THIS_WEEK"].sum())
     overall_percent = (min(total_actual / total_target, 1) * 100) if total_target > 0 else 0
+    avg_consistency = round(float(report_df["CONSISTENCY_SCORE"].mean()), 1) if not report_df.empty else 0
+    active_streaks = int((report_df["CURRENT_STREAK"] > 0).sum()) if not report_df.empty else 0
 
     embed = discord.Embed(
         title=f"Weekly Discipline Report ({start_date.strftime('%m/%d')} - {end_date.strftime('%m/%d')})",
-        description="Progress against each task's weekly target frequency.",
+        description="Progress against each task's weekly target frequency, with streak and consistency context.",
         color=0xF1C40F,
     )
 
-    sorted_report = report_df.sort_values(by=["FREQUENCY_PER_WEEK", "TASK"], ascending=[False, True])
+    sorted_report = report_df.sort_values(by=["AT_RISK_THIS_WEEK", "FREQUENCY_PER_WEEK", "TASK"], ascending=[False, False, True])
     count = 0
     for _, row in sorted_report.iterrows():
         if count >= 20:
@@ -1330,17 +1557,70 @@ async def weekly_discipline_summary(ctx, week_start=None):
         actual = int(row["COMPLETIONS_THIS_WEEK"])
         percent = round(min(actual / target, 1) * 100, 1) if target > 0 else 0
         extra = f" (+{actual - target})" if actual > target else ""
+        alert_line = "At risk this week" if bool(row["AT_RISK_THIS_WEEK"]) else "On pace"
         value = (
             f"Category: {catagory}\n"
             f"This Week: {actual}/{target}{extra}\n"
-            f"Progress: {percent}%"
+            f"Progress: {percent}%\n"
+            f"Current Streak: {int(row['CURRENT_STREAK'])} | Best: {int(row['LONGEST_STREAK'])}\n"
+            f"4-Week Consistency: {row['CONSISTENCY_SCORE']}%\n"
+            f"Alert: {alert_line}"
         )
         embed.add_field(name=f"{count + 1}. {task_name}", value=value, inline=False)
         count += 1
 
+    embed.add_field(name="Alerts", value=build_discipline_alert_summary(report_df, for_current_week=end_date >= today), inline=False)
     embed.set_footer(
-        text=f"Overall: {total_actual}/{total_target} ({round(overall_percent, 1)}%) | Use {command_prefix}weekly_discipline_summary YYYYMMDD"
+        text=(
+            f"Overall: {total_actual}/{total_target} ({round(overall_percent, 1)}%) | "
+            f"Avg consistency: {avg_consistency}% | Active streaks: {active_streaks} | "
+            f"Use {command_prefix}weekly_discipline_summary YYYYMMDD"
+        )
     )
+    await ctx.send(embed=embed, delete_after=180)
+
+
+@bot.command(name="discipline_streaks", help="Current streaks, longest streaks, and recent discipline consistency")
+async def discipline_streaks(ctx):
+    ensure_discipline_dataframe_exists()
+    ensure_discipline_completion_log_exists()
+
+    discipline_df = pd.read_pickle(path_for_discipline_list)
+    if discipline_df.empty:
+        await ctx.send("No discipline tasks are currently tracked.", delete_after=60)
+        return
+
+    completion_df = pd.read_pickle(path_for_discipline_completion_log)
+    today = pd.to_datetime(datetime.datetime.now().date()).normalize()
+    week_start = today - pd.Timedelta(days=int(today.weekday()))
+    week_end = week_start + pd.Timedelta(days=6)
+    report_df = build_discipline_insight_df(discipline_df, completion_df, week_start, week_end, reference_date=today)
+
+    embed = discord.Embed(
+        title="Discipline Streaks",
+        description="Current streaks, best streaks, and 4-week consistency scores.",
+        color=0x9B59B6,
+    )
+
+    sorted_report = report_df.sort_values(by=["CURRENT_STREAK", "CONSISTENCY_SCORE", "LONGEST_STREAK", "TASK"], ascending=[False, False, False, True])
+    count = 0
+    for _, row in sorted_report.iterrows():
+        if count >= 20:
+            break
+        embed.add_field(
+            name=f"{count + 1}. {row['TASK']}",
+            value=(
+                f"Category: {row['CATAGORY']}\n"
+                f"Current Streak: {int(row['CURRENT_STREAK'])} day(s)\n"
+                f"Longest Streak: {int(row['LONGEST_STREAK'])} day(s)\n"
+                f"4-Week Consistency: {row['CONSISTENCY_SCORE']}%\n"
+                f"This Week: {int(row['COMPLETIONS_THIS_WEEK'])}/{int(row['FREQUENCY_PER_WEEK'])}"
+            ),
+            inline=False,
+        )
+        count += 1
+
+    embed.set_footer(text=build_discipline_alert_summary(report_df, for_current_week=True))
     await ctx.send(embed=embed, delete_after=180)
 
 
