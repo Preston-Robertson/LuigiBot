@@ -120,6 +120,8 @@ def build_discipline_row(task_name, catagory, frequency_per_week):
             "TASK": [task_name],
             "CATAGORY": [catagory],
             "FREQUENCY_PER_WEEK": [int(frequency_per_week)],
+            "ACTIVE": [True],
+            "CURRENT_STREAK": [0],
         }
     )
 
@@ -139,7 +141,7 @@ def build_discipline_completion_row(task_name, catagory, completed_date):
 def ensure_discipline_dataframe_exists():
     os.makedirs(os.path.dirname(path_for_discipline_list), exist_ok=True)
 
-    expected_cols = ["TASK", "CATAGORY", "FREQUENCY_PER_WEEK"]
+    expected_cols = ["TASK", "CATAGORY", "FREQUENCY_PER_WEEK", "ACTIVE", "CURRENT_STREAK"]
 
     if os.path.exists(path_for_discipline_list):
         try:
@@ -148,6 +150,8 @@ def ensure_discipline_dataframe_exists():
                 existing_df = existing_df[expected_cols].copy()
                 existing_df["FREQUENCY_PER_WEEK"] = pd.to_numeric(existing_df["FREQUENCY_PER_WEEK"], errors="coerce").fillna(1).astype(int)
                 existing_df["FREQUENCY_PER_WEEK"] = existing_df["FREQUENCY_PER_WEEK"].clip(lower=1, upper=7)
+                existing_df["ACTIVE"] = existing_df["ACTIVE"].astype(bool).fillna(True)
+                existing_df["CURRENT_STREAK"] = pd.to_numeric(existing_df["CURRENT_STREAK"], errors="coerce").fillna(0).astype(int)
                 existing_df.to_pickle(path_for_discipline_list)
                 return
 
@@ -156,6 +160,8 @@ def ensure_discipline_dataframe_exists():
                     "TASK": existing_df["TASK"].astype(str) if "TASK" in existing_df.columns else pd.Series(dtype="object"),
                     "CATAGORY": existing_df["CATAGORY"].astype(str) if "CATAGORY" in existing_df.columns else "Discipline",
                     "FREQUENCY_PER_WEEK": 1,
+                    "ACTIVE": True,
+                    "CURRENT_STREAK": 0,
                 }
             )
             migrated_df.to_pickle(path_for_discipline_list)
@@ -619,6 +625,10 @@ def get_active_discipline_df(discipline_list_df):
     if filtered_df.empty:
         return filtered_df
 
+    # Filter to only active tasks
+    if "ACTIVE" in filtered_df.columns:
+        filtered_df = filtered_df[filtered_df["ACTIVE"] == True]
+
     return filtered_df.sort_values(by=["FREQUENCY_PER_WEEK", "TASK"], ascending=[False, True])
 
 
@@ -948,7 +958,7 @@ async def on_ready():
         embed.add_field(
             name="🎯 Discipline Tracker Commands",
             value=(
-                f"`{command_prefix}create_discipline_task` — Add a discipline item (task name, category, frequency/week 1-7)\n"
+                f"`/create_discipline_task` or `{command_prefix}create_discipline_task` — Add a discipline item (task name, category, frequency/week 1-7)\n"
                 f"`{command_prefix}discipline_list` — View all tracked discipline items\n"
                 f"`{command_prefix}log_discipline_completion` — Log completion of a discipline task (for data collection)\n"
                 f"`{command_prefix}today_completions` — View today's logged discipline completions (or any date)\n"
@@ -1361,7 +1371,12 @@ async def to_do_weekly_visual(ctx, week_end=None):
         await ctx.send(f"Could not generate weekly to-do visual: {e}", delete_after=60)
 
 
-@bot.command(name = "create_discipline_task", help = "Create a task in the separate discipline tracker")
+@bot.hybrid_command(name="create_discipline_task", description="Add a task to the separate discipline tracker")
+@app_commands.describe(
+    task_name="Discipline task name",
+    catagory="Task category",
+    frequency_per_week="How many times per week (1-7)",
+)
 async def create_discipline_task(
     ctx,
     task_name,
@@ -1422,6 +1437,42 @@ async def discipline_list(ctx):
     await ctx.channel.send(embed=embed, delete_after=120)
 
 
+def calculate_streak(task_name, completion_df, reference_date=None):
+    """Calculate current streak for a task based on completion log."""
+    if reference_date is None:
+        reference_date = pd.to_datetime(datetime.datetime.now().date()).normalize()
+    else:
+        reference_date = pd.to_datetime(reference_date).normalize()
+    
+    if completion_df.empty:
+        return 0
+    
+    task_completions = completion_df[completion_df["TASK"].astype(str).str.lower() == str(task_name).strip().lower()].copy()
+    if task_completions.empty:
+        return 0
+    
+    task_completions["COMPLETED_DATE"] = pd.to_datetime(task_completions["COMPLETED_DATE"]).dt.normalize()
+    unique_dates = sorted(task_completions["COMPLETED_DATE"].unique(), reverse=True)
+    
+    if not unique_dates:
+        return 0
+    
+    streak = 0
+    current_date = reference_date
+    
+    for completion_date in unique_dates:
+        if completion_date == current_date:
+            streak += 1
+            current_date = current_date - pd.Timedelta(days=1)
+        elif completion_date == current_date:
+            streak += 1
+            current_date = current_date - pd.Timedelta(days=1)
+        else:
+            break
+    
+    return streak
+
+
 @bot.command(name = "log_discipline_completion", help= "Log a completed discipline item for data collection")
 async def log_discipline_completion(ctx, task_name, completed_date=None):
     ensure_discipline_dataframe_exists()
@@ -1438,9 +1489,28 @@ async def log_discipline_completion(ctx, task_name, completed_date=None):
     catagory = str(task_row["CATAGORY"])
 
     if completed_date in (None, ""):
-        completed_date = datetime.datetime.now().date()
+        target_completed_date = datetime.datetime.now().date()
+    else:
+        try:
+            target_completed_date = pd.to_datetime(completed_date).date()
+        except Exception:
+            await ctx.send("Invalid date format. Use YYYYMMDD (e.g., 20260511).", delete_after=60)
+            return
 
-    completion_row = build_discipline_completion_row(task_name=task_row["TASK"], catagory=catagory, completed_date=completed_date)
+    target_completed_date_normalized = pd.to_datetime(target_completed_date).normalize()
+    
+    # Check for duplicate entry
+    completion_df = pd.read_pickle(path_for_discipline_completion_log)
+    duplicate_check = completion_df[
+        (completion_df["TASK"].astype(str).str.lower() == str(task_name).strip().lower())
+        & (completion_df["COMPLETED_DATE"] == target_completed_date_normalized)
+    ]
+    
+    if not duplicate_check.empty:
+        await ctx.send(f"'{task_row['TASK']}' has already been logged for {target_completed_date_normalized.strftime('%m/%d/%Y')}.", delete_after=60)
+        return
+
+    completion_row = build_discipline_completion_row(task_name=task_row["TASK"], catagory=catagory, completed_date=target_completed_date)
 
     try:
         completion_df = pd.read_pickle(path_for_discipline_completion_log)
@@ -1449,9 +1519,60 @@ async def log_discipline_completion(ctx, task_name, completed_date=None):
 
     updated_completion_df = pd.concat([completion_df, completion_row], ignore_index=True)
     updated_completion_df.to_pickle(path_for_discipline_completion_log)
+    
+    # Update streak for this task
+    new_streak = calculate_streak(task_row["TASK"], updated_completion_df, reference_date=target_completed_date)
+    discipline_df.loc[task_match.index, "CURRENT_STREAK"] = new_streak
+    discipline_df.to_pickle(path_for_discipline_list)
 
     logged_date = pd.to_datetime(completion_row["COMPLETED_DATE"].iloc[0]).strftime("%m/%d/%Y")
-    await ctx.send(f"Logged completion for '{task_row['TASK']}' on {logged_date}.", delete_after=60)
+    streak_msg = f" (Streak: {new_streak} day(s))" if new_streak > 0 else ""
+    await ctx.send(f"Logged completion for '{task_row['TASK']}' on {logged_date}.{streak_msg}", delete_after=60)
+
+
+@bot.command(name = "deactivate_discipline_task", help= "Deactivate a discipline task (hide it from the list without deleting)")
+async def deactivate_discipline_task(ctx, task_name):
+    ensure_discipline_dataframe_exists()
+
+    discipline_df = pd.read_pickle(path_for_discipline_list)
+    task_match = discipline_df[discipline_df["TASK"].astype(str).str.lower() == str(task_name).strip().lower()]
+
+    if task_match.empty:
+        await ctx.send(f"Task not found in discipline tracker. Use {command_prefix}discipline_list to view tracked items.", delete_after=60)
+        return
+
+    discipline_df.loc[task_match.index, "ACTIVE"] = False
+    discipline_df.to_pickle(path_for_discipline_list)
+    
+    await ctx.send(f"Deactivated '{task_match.iloc[0]['TASK']}'. It will no longer appear in the active tracker.", delete_after=60)
+
+
+@bot.command(name = "update_discipline_frequency", help= "Update the weekly frequency target for a discipline task")
+async def update_discipline_frequency(ctx, task_name, new_frequency):
+    ensure_discipline_dataframe_exists()
+
+    discipline_df = pd.read_pickle(path_for_discipline_list)
+    task_match = discipline_df[discipline_df["TASK"].astype(str).str.lower() == str(task_name).strip().lower()]
+
+    if task_match.empty:
+        await ctx.send(f"Task not found in discipline tracker. Use {command_prefix}discipline_list to view tracked items.", delete_after=60)
+        return
+
+    try:
+        new_frequency = int(new_frequency)
+    except ValueError:
+        await ctx.send("New frequency must be a number between 1 and 7.", delete_after=60)
+        return
+
+    if new_frequency < 1 or new_frequency > 7:
+        await ctx.send("Frequency must be between 1 and 7.", delete_after=60)
+        return
+
+    old_frequency = int(task_match.iloc[0]["FREQUENCY_PER_WEEK"])
+    discipline_df.loc[task_match.index, "FREQUENCY_PER_WEEK"] = new_frequency
+    discipline_df.to_pickle(path_for_discipline_list)
+    
+    await ctx.send(f"Updated '{task_match.iloc[0]['TASK']}' frequency from {old_frequency} to {new_frequency} times per week.", delete_after=60)
 
 
 @bot.command(name = "today_completions", help= "View discipline items you've logged as completed today")
