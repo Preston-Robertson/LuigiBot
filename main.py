@@ -10,8 +10,10 @@ from discord.ext import commands, tasks
 import json
 import os
 import datetime
+import math
 import pytz
 from io import BytesIO
+import textwrap
 
 # For Slash Commands
 from discord import app_commands
@@ -21,6 +23,8 @@ from discord import interactions
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.patheffects as pe
+from matplotlib.patches import Polygon
 import pandas as pd
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
@@ -55,6 +59,7 @@ discipline_daily_hour = int(config.get("Discipline_Daily_Hour", 23))
 discipline_daily_minute = int(config.get("Discipline_Daily_Minute", 15))
 
 last_discipline_daily_date = None
+last_discipline_visual_date = None
 last_todo_visual_date = None
 last_todo_weekly_visual_date = None
 
@@ -222,27 +227,203 @@ def build_completed_task_series(to_do_list_df, end_date, days=7):
     return completion_counts.reindex(date_index, fill_value=0).astype(int)
 
 
+VISUAL_THEME = {
+    "bg": "#1E1F22",
+    "panel": "#2B2D31",
+    "panel_alt": "#242732",
+    "grid": "#3A3D45",
+    "text": "#F2F3F5",
+    "muted": "#B5BAC1",
+    "discord": "#5865F2",
+    "luigi": "#43B581",
+    "cyan": "#4EDFD2",
+    "violet": "#6E63D9",
+    "warn": "#FAA61A",
+    "danger": "#ED4245",
+    "neutral": "#7F8C8D",
+    "target": "#404A86",
+}
+
+VISUAL_FONT_STACK = ["gg sans", "Whitney", "Noto Sans", "DejaVu Sans", "sans-serif"]
+matplotlib.rcParams["font.family"] = VISUAL_FONT_STACK
+
+
+def style_axis_labels(labels, wrap_width=12, max_chars=24):
+    formatted = []
+    for label in labels:
+        label_text = str(label).strip()
+        if len(label_text) > max_chars:
+            label_text = label_text[: max_chars - 1].rstrip() + "..."
+        formatted.append(textwrap.fill(label_text, width=wrap_width, break_long_words=False))
+    return formatted
+
+
+def apply_chart_theme(ax):
+    ax.set_facecolor(VISUAL_THEME["panel"])
+    ax.patch.set_edgecolor(VISUAL_THEME["panel_alt"])
+    ax.patch.set_linewidth(1.0)
+    ax.grid(axis="y", linestyle="-", linewidth=1.0, alpha=0.28, color=VISUAL_THEME["grid"])
+    ax.set_axisbelow(True)
+
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
+    for spine in ["left", "bottom"]:
+        ax.spines[spine].set_color(VISUAL_THEME["grid"])
+
+    ax.tick_params(colors=VISUAL_THEME["muted"])
+
+
+def style_chart_title(ax, chart_title):
+    title_obj = ax.set_title(
+        chart_title,
+        fontsize=15,
+        fontweight="bold",
+        color=VISUAL_THEME["text"],
+        pad=20,
+        fontfamily=VISUAL_FONT_STACK,
+    )
+    title_obj.set_path_effects([
+        pe.withStroke(linewidth=3.5, foreground="#171821", alpha=0.95),
+    ])
+
+
+def draw_glow_bars(ax, x_positions, values, colors, width=0.8, alpha=0.16):
+    ax.bar(
+        x_positions,
+        values,
+        width=width,
+        color=colors,
+        edgecolor="none",
+        alpha=alpha,
+        zorder=1,
+    )
+
+
+def round_bar_tops(ax, bars, radius=0.12, segments=18, horizontal_scale=1.4, vertical_scale=0.18, vertical_radius=None):
+    """Replace rectangular bars with bars that have rounded top corners."""
+    for bar in bars:
+        height = float(bar.get_height())
+        if height <= 0:
+            continue
+
+        x = float(bar.get_x())
+        y = float(bar.get_y())
+        width = float(bar.get_width())
+        rx = min(radius * horizontal_scale, width / 2.0)
+        if vertical_radius is None:
+            ry = min(height * vertical_scale, height)
+        else:
+            ry = min(float(vertical_radius), height)
+
+        if rx <= 0 or ry <= 0:
+            continue
+
+        left_center = (x + rx, y + height - ry)
+        right_center = (x + width - rx, y + height - ry)
+
+        points = [(x, y), (x, y + height - ry)]
+
+        left_thetas = [
+            3.14159265 - ((3.14159265 / 2.0) * i / segments)
+            for i in range(1, segments + 1)
+        ]
+        for theta in left_thetas:
+            points.append(
+                (
+                    left_center[0] + rx * math.cos(theta),
+                    left_center[1] + ry * math.sin(theta),
+                )
+            )
+
+        right_thetas = [
+            (3.14159265 / 2.0) - ((3.14159265 / 2.0) * i / segments)
+            for i in range(1, segments + 1)
+        ]
+        for theta in right_thetas:
+            points.append(
+                (
+                    right_center[0] + rx * math.cos(theta),
+                    right_center[1] + ry * math.sin(theta),
+                )
+            )
+
+        points.extend([(x + width, y), (x, y)])
+
+        rounded_patch = Polygon(
+            points,
+            closed=True,
+            facecolor=bar.get_facecolor(),
+            edgecolor="none",
+            alpha=bar.get_alpha(),
+            zorder=bar.get_zorder(),
+        )
+        ax.add_patch(rounded_patch)
+        bar.set_visible(False)
+
+
 def render_completed_task_bar_chart(completion_series, chart_title, subtitle=None, highlight_index=None):
     labels = [dt.strftime("%a\n%m/%d") for dt in completion_series.index]
     values = completion_series.values.tolist()
 
-    fig, ax = plt.subplots(figsize=(9, 4.5), dpi=150)
-    bar_colors = ["#8FB8FF"] * len(values)
+    fig, ax = plt.subplots(figsize=(10, 5.2), dpi=150)
+    fig.patch.set_facecolor(VISUAL_THEME["bg"])
+    apply_chart_theme(ax)
+
+    bar_colors = [VISUAL_THEME["violet"]] * len(values)
 
     if highlight_index is not None and 0 <= highlight_index < len(bar_colors):
-        bar_colors[highlight_index] = "#2E6DFF"
+        bar_colors[highlight_index] = VISUAL_THEME["luigi"]
 
-    bars = ax.bar(range(len(values)), values, color=bar_colors, width=0.7)
+    draw_glow_bars(
+        ax,
+        list(range(len(values))),
+        values,
+        [VISUAL_THEME["cyan"] if c != VISUAL_THEME["luigi"] else VISUAL_THEME["luigi"] for c in bar_colors],
+        width=0.72,
+        alpha=0.13,
+    )
 
-    ax.set_title(chart_title, fontsize=14, fontweight="bold", pad=12)
+    bars = ax.bar(range(len(values)), values, color=bar_colors, width=0.68, edgecolor="none")
+    todo_cap_depth = max(max(values), 1) * 0.085
+    round_bar_tops(
+        ax,
+        bars,
+        radius=0.34,
+        horizontal_scale=1.45,
+        vertical_scale=0.16,
+        vertical_radius=todo_cap_depth,
+    )
+
+    if highlight_index is not None and 0 <= highlight_index < len(values):
+        ax.scatter(
+            [highlight_index],
+            [values[highlight_index] + 0.2],
+            s=220,
+            color=VISUAL_THEME["luigi"],
+            alpha=0.22,
+            zorder=3,
+        )
+
+    style_chart_title(ax, chart_title)
     if subtitle:
-        ax.text(0.5, 1.01, subtitle, ha="center", va="bottom", transform=ax.transAxes, fontsize=10, color="#444444")
+        ax.text(
+            0.015,
+            0.99,
+            subtitle,
+            ha="left",
+            va="top",
+            transform=ax.transAxes,
+            fontsize=9,
+            color=VISUAL_THEME["muted"],
+            fontfamily=VISUAL_FONT_STACK,
+        )
 
     ax.set_xticks(range(len(labels)))
-    ax.set_xticklabels(labels, fontsize=9)
-    ax.set_ylabel("Tasks Completed", fontsize=10)
-    ax.grid(axis="y", linestyle="--", alpha=0.25)
-    ax.set_axisbelow(True)
+    ax.set_xticklabels(labels, fontsize=9, color=VISUAL_THEME["text"], fontfamily=VISUAL_FONT_STACK)
+    ax.set_ylabel("Tasks Completed", fontsize=10, color=VISUAL_THEME["text"], fontfamily=VISUAL_FONT_STACK)
+
+    max_height = max(values) if values else 1
+    ax.set_ylim(0, max_height + 1.2)
 
     for bar in bars:
         height = int(bar.get_height())
@@ -253,14 +434,12 @@ def render_completed_task_bar_chart(completion_series, chart_title, subtitle=Non
             textcoords="offset points",
             ha="center",
             va="bottom",
-            fontsize=9,
-            color="#1C1C1C",
+            fontsize=8,
+            color=VISUAL_THEME["text"],
+            fontfamily=VISUAL_FONT_STACK,
         )
 
-    for spine in ["top", "right"]:
-        ax.spines[spine].set_visible(False)
-
-    fig.tight_layout()
+    fig.tight_layout(pad=1.25)
     image_buffer = BytesIO()
     fig.savefig(image_buffer, format="png", bbox_inches="tight")
     plt.close(fig)
@@ -519,48 +698,98 @@ def pause_task_tracking(to_do_list_df, task_mask, now_timestamp):
 
 
 def render_discipline_daily_goal_status_chart(status_df, chart_title, subtitle=None):
-    labels = status_df["TASK"].astype(str).tolist()
+    labels = style_axis_labels(status_df["TASK"].astype(str).tolist(), wrap_width=12, max_chars=24)
     values = status_df["GOAL_MET_BINARY"].astype(int).tolist()
 
-    fig, ax = plt.subplots(figsize=(max(10, len(labels) * 0.75), 4.8), dpi=150)
+    fig, ax = plt.subplots(figsize=(max(11, len(labels) * 0.95), 5.8), dpi=150)
+    fig.patch.set_facecolor(VISUAL_THEME["bg"])
+    apply_chart_theme(ax)
 
     x_positions = range(len(labels))
+    rounded_daily_bars = []
     for idx, (_, row) in enumerate(status_df.iterrows()):
         status_code = row["STATUS_CODE"]
         if status_code == "met_today":
-            ax.bar(idx, 1, color="#2E86DE", width=0.65)
+            rounded_daily_bars.extend(ax.bar(idx, 1, color=VISUAL_THEME["luigi"], width=0.68))
         elif status_code == "met_before_today":
-            ax.bar(idx, 1, color="#27AE60", width=0.65)
+            rounded_daily_bars.extend(ax.bar(idx, 1, color=VISUAL_THEME["discord"], width=0.68))
         elif status_code == "done_today_not_met":
-            ax.bar(idx, 0.15, color="#F39C12", width=0.65)
+            rounded_daily_bars.extend(ax.bar(idx, 0.15, color=VISUAL_THEME["warn"], width=0.68))
         else:
-            ax.bar(idx, 0.02, facecolor="none", edgecolor="#95A5A6", linewidth=1.5, width=0.65)
+            ax.bar(idx, 0.02, facecolor="none", edgecolor=VISUAL_THEME["neutral"], linewidth=1.5, width=0.68)
+
+    round_bar_tops(
+        ax,
+        rounded_daily_bars,
+        radius=0.30,
+        horizontal_scale=1.5,
+        vertical_scale=0.18,
+        vertical_radius=0.18,
+    )
+
+    glow_x = []
+    glow_h = []
+    glow_c = []
+    for idx, (_, row) in enumerate(status_df.iterrows()):
+        status_code = row["STATUS_CODE"]
+        if status_code == "met_today":
+            glow_x.append(idx)
+            glow_h.append(1)
+            glow_c.append(VISUAL_THEME["luigi"])
+        elif status_code == "met_before_today":
+            glow_x.append(idx)
+            glow_h.append(1)
+            glow_c.append(VISUAL_THEME["cyan"])
+        elif status_code == "done_today_not_met":
+            glow_x.append(idx)
+            glow_h.append(0.15)
+            glow_c.append(VISUAL_THEME["warn"])
+
+    if glow_x:
+        draw_glow_bars(ax, glow_x, glow_h, glow_c, width=0.70, alpha=0.12)
 
     ax.set_ylim(0, 1.15)
     ax.set_xticks(list(x_positions))
-    ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=9)
+    ax.set_xticklabels(labels, rotation=20, ha="right", fontsize=9, color=VISUAL_THEME["text"], fontfamily=VISUAL_FONT_STACK)
     ax.set_yticks([0, 1])
-    ax.set_yticklabels(["Need", "Met"], fontsize=9)
-    ax.set_ylabel("Weekly Goal Status", fontsize=10)
-    ax.set_title(chart_title, fontsize=14, fontweight="bold", pad=12)
+    ax.set_yticklabels(["Need", "Met"], fontsize=9, color=VISUAL_THEME["text"], fontfamily=VISUAL_FONT_STACK)
+    ax.set_ylabel("Weekly Goal Status", fontsize=10, color=VISUAL_THEME["text"], fontfamily=VISUAL_FONT_STACK)
+    style_chart_title(ax, chart_title)
 
     if subtitle:
-        ax.text(0.5, 1.01, subtitle, ha="center", va="bottom", transform=ax.transAxes, fontsize=10, color="#444444")
-
-    ax.grid(axis="y", linestyle="--", alpha=0.2)
-    ax.set_axisbelow(True)
-    for spine in ["top", "right"]:
-        ax.spines[spine].set_visible(False)
+        ax.text(
+            0.015,
+            0.99,
+            subtitle,
+            ha="left",
+            va="top",
+            transform=ax.transAxes,
+            fontsize=9,
+            color=VISUAL_THEME["muted"],
+            fontfamily=VISUAL_FONT_STACK,
+        )
 
     legend_handles = [
-        plt.Rectangle((0, 0), 1, 1, color="#2E86DE", label="Reached Goal Today"),
-        plt.Rectangle((0, 0), 1, 1, color="#27AE60", label="Goal Already Met"),
-        plt.Rectangle((0, 0), 1, 1, color="#F39C12", label="Done Today (Not Met Yet)"),
-        plt.Rectangle((0, 0), 1, 1, facecolor="none", edgecolor="#95A5A6", label="Needs Completion"),
+        plt.Rectangle((0, 0), 1, 1, color=VISUAL_THEME["luigi"], label="Reached Goal Today"),
+        plt.Rectangle((0, 0), 1, 1, color=VISUAL_THEME["discord"], label="Goal Already Met"),
+        plt.Rectangle((0, 0), 1, 1, color=VISUAL_THEME["warn"], label="Done Today (Not Met Yet)"),
+        plt.Rectangle((0, 0), 1, 1, facecolor="none", edgecolor=VISUAL_THEME["neutral"], label="Needs Completion"),
     ]
-    ax.legend(handles=legend_handles, loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=8)
+    ax.legend(
+        handles=legend_handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.16),
+        ncol=2,
+        fontsize=8,
+        facecolor=VISUAL_THEME["panel"],
+        edgecolor=VISUAL_THEME["grid"],
+        labelcolor=VISUAL_THEME["text"],
+        framealpha=0.95,
+        borderpad=0.7,
+    )
 
-    fig.tight_layout()
+    fig.subplots_adjust(top=0.84, bottom=0.28)
+    fig.tight_layout(pad=1.2)
     image_buffer = BytesIO()
     fig.savefig(image_buffer, format="png", bbox_inches="tight")
     plt.close(fig)
@@ -569,31 +798,86 @@ def render_discipline_daily_goal_status_chart(status_df, chart_title, subtitle=N
 
 
 def render_discipline_weekly_progress_chart(report_df, chart_title, subtitle=None):
-    labels = report_df["TASK"].astype(str).tolist()
+    labels = style_axis_labels(report_df["TASK"].astype(str).tolist(), wrap_width=12, max_chars=24)
     actual = report_df["COMPLETIONS_THIS_WEEK"].astype(int).tolist()
     target = report_df["FREQUENCY_PER_WEEK"].astype(int).tolist()
 
-    fig, ax = plt.subplots(figsize=(max(10, len(labels) * 0.75), 4.8), dpi=150)
+    fig, ax = plt.subplots(figsize=(max(11, len(labels) * 0.95), 5.8), dpi=150)
+    fig.patch.set_facecolor(VISUAL_THEME["bg"])
+    apply_chart_theme(ax)
     x_positions = list(range(len(labels)))
-    width = 0.38
+    width = 0.42
 
-    bars_target = ax.bar([x - width / 2 for x in x_positions], target, width=width, color="#D5DBDB", label="Target")
-    actual_colors = ["#27AE60" if a >= t else "#E74C3C" for a, t in zip(actual, target)]
+    bars_target = ax.bar([x - width / 2 for x in x_positions], target, width=width, color=VISUAL_THEME["target"], label="Target")
+    actual_colors = [VISUAL_THEME["luigi"] if a >= t else VISUAL_THEME["danger"] for a, t in zip(actual, target)]
     bars_actual = ax.bar([x + width / 2 for x in x_positions], actual, width=width, color=actual_colors, label="Actual")
 
+    draw_glow_bars(
+        ax,
+        [x - width / 2 for x in x_positions],
+        target,
+        [VISUAL_THEME["discord"]] * len(target),
+        width=0.43,
+        alpha=0.12,
+    )
+    draw_glow_bars(
+        ax,
+        [x + width / 2 for x in x_positions],
+        actual,
+        [VISUAL_THEME["cyan"] if a >= t else VISUAL_THEME["danger"] for a, t in zip(actual, target)],
+        width=0.43,
+        alpha=0.13,
+    )
+
+    weekly_cap_depth = max(target + actual) * 0.16 if (target or actual) else 0.6
+    round_bar_tops(
+        ax,
+        bars_target,
+        radius=0.24,
+        horizontal_scale=1.45,
+        vertical_scale=0.2,
+        vertical_radius=weekly_cap_depth,
+    )
+    round_bar_tops(
+        ax,
+        bars_actual,
+        radius=0.24,
+        horizontal_scale=1.45,
+        vertical_scale=0.2,
+        vertical_radius=weekly_cap_depth,
+    )
+
     ax.set_xticks(x_positions)
-    ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=9)
-    ax.set_ylabel("Days Completed This Week", fontsize=10)
-    ax.set_title(chart_title, fontsize=14, fontweight="bold", pad=12)
+    ax.set_xticklabels(labels, rotation=20, ha="right", fontsize=9, color=VISUAL_THEME["text"], fontfamily=VISUAL_FONT_STACK)
+    ax.set_ylabel("Days Completed This Week", fontsize=10, color=VISUAL_THEME["text"], fontfamily=VISUAL_FONT_STACK)
+    style_chart_title(ax, chart_title)
 
     if subtitle:
-        ax.text(0.5, 1.01, subtitle, ha="center", va="bottom", transform=ax.transAxes, fontsize=10, color="#444444")
+        ax.text(
+            0.015,
+            0.99,
+            subtitle,
+            ha="left",
+            va="top",
+            transform=ax.transAxes,
+            fontsize=9,
+            color=VISUAL_THEME["muted"],
+            fontfamily=VISUAL_FONT_STACK,
+        )
 
     max_y = max(target + actual) if (target or actual) else 1
-    ax.set_ylim(0, max_y + 1)
-    ax.grid(axis="y", linestyle="--", alpha=0.2)
-    ax.set_axisbelow(True)
-    ax.legend(fontsize=9)
+    ax.set_ylim(0, max_y + 1.2)
+    ax.legend(
+        fontsize=9,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.14),
+        ncol=2,
+        facecolor=VISUAL_THEME["panel"],
+        edgecolor=VISUAL_THEME["grid"],
+        labelcolor=VISUAL_THEME["text"],
+        framealpha=0.95,
+        borderpad=0.7,
+    )
 
     for bars in [bars_target, bars_actual]:
         for bar in bars:
@@ -606,12 +890,12 @@ def render_discipline_weekly_progress_chart(report_df, chart_title, subtitle=Non
                 ha="center",
                 va="bottom",
                 fontsize=8,
+                color=VISUAL_THEME["text"],
+                fontfamily=VISUAL_FONT_STACK,
             )
 
-    for spine in ["top", "right"]:
-        ax.spines[spine].set_visible(False)
-
-    fig.tight_layout()
+    fig.subplots_adjust(top=0.84, bottom=0.27)
+    fig.tight_layout(pad=1.2)
     image_buffer = BytesIO()
     fig.savefig(image_buffer, format="png", bbox_inches="tight")
     plt.close(fig)
@@ -1034,6 +1318,7 @@ async def to_do_list(ctx):
 # This command outputs the To-Do List Summary at 12:45 AM EST daily
 async def send_daily_message():
     global last_discipline_daily_date
+    global last_discipline_visual_date
     global last_todo_visual_date
     global last_todo_weekly_visual_date
 
@@ -1128,6 +1413,23 @@ async def send_daily_message():
             await to_do_list_channel.send(f"<@{user_id}>, Task Completed Today: {datetime.datetime.now().strftime('%m/%d/%Y')}")
             await to_do_list_channel.send(embed=embed)
 
+            try:
+                completion_series = build_completed_task_series(to_do_list_df, end_date=now.date(), days=7)
+                today_total = int(completion_series.iloc[-1]) if not completion_series.empty else 0
+                week_total = int(completion_series.sum())
+                avg_daily = round(float(completion_series.mean()), 1) if len(completion_series) > 0 else 0
+
+                subtitle = f"Today: {today_total} | Last 7 days: {week_total} | Avg/day: {avg_daily}"
+                chart = render_completed_task_bar_chart(
+                    completion_series=completion_series,
+                    chart_title="Tasks Completed Today (7-Day Context)",
+                    subtitle=subtitle,
+                    highlight_index=len(completion_series) - 1,
+                )
+                await to_do_list_channel.send(file=discord.File(fp=chart, filename="tasks_completed_today_visual.png"))
+            except Exception as e:
+                print(f"Error sending completed-task daily visual: {e}")
+
     if now.hour == discipline_daily_hour and now.minute == discipline_daily_minute:
         if last_discipline_daily_date != now.date():
             discipline_channel = get_discipline_channel()
@@ -1189,6 +1491,84 @@ async def send_daily_message():
                     print(f"Error sending to-do completion trend chart: {e}")
 
             last_todo_visual_date = now.date()
+
+        if last_discipline_visual_date != now.date():
+            discipline_channel = get_discipline_channel()
+            if discipline_channel:
+                try:
+                    ensure_discipline_dataframe_exists()
+                    ensure_discipline_completion_log_exists()
+
+                    discipline_df = pd.read_pickle(path_for_discipline_list)
+                    completion_df = pd.read_pickle(path_for_discipline_completion_log)
+
+                    if not discipline_df.empty:
+                        today = pd.to_datetime(now.date()).normalize()
+                        week_start = today - pd.Timedelta(days=int(today.weekday()))
+                        week_end = week_start + pd.Timedelta(days=6)
+
+                        normalized_completion_df = normalize_discipline_completion_df(completion_df)
+                        report_df = build_discipline_weekly_counts(
+                            discipline_df,
+                            normalized_completion_df,
+                            week_start,
+                            week_end,
+                        )
+                        report_df["COMPLETED_TODAY"] = report_df["TASK"].apply(
+                            lambda task: get_task_completed_today(task, normalized_completion_df, today)
+                        )
+
+                        status_codes = []
+                        goal_met_flags = []
+                        reached_today_count = 0
+                        goal_already_met_count = 0
+                        done_today_not_met_count = 0
+                        needs_completion_count = 0
+
+                        for _, row in report_df.iterrows():
+                            target = int(row["FREQUENCY_PER_WEEK"])
+                            actual_now = int(row["COMPLETIONS_THIS_WEEK"])
+                            actual_before_today = int(row["COMPLETIONS_BEFORE_END_DATE"])
+                            completed_today = bool(row["COMPLETED_TODAY"])
+
+                            if actual_now >= target:
+                                goal_met_flags.append(1)
+                                if completed_today and actual_before_today < target:
+                                    status_codes.append("met_today")
+                                    reached_today_count += 1
+                                else:
+                                    status_codes.append("met_before_today")
+                                    goal_already_met_count += 1
+                            else:
+                                goal_met_flags.append(0)
+                                if completed_today:
+                                    status_codes.append("done_today_not_met")
+                                    done_today_not_met_count += 1
+                                else:
+                                    status_codes.append("needs_completion")
+                                    needs_completion_count += 1
+
+                        report_df["STATUS_CODE"] = status_codes
+                        report_df["GOAL_MET_BINARY"] = goal_met_flags
+
+                        subtitle = (
+                            f"Met Today: {reached_today_count} | Already Met: {goal_already_met_count} | "
+                            f"Done Today: {done_today_not_met_count} | Need: {needs_completion_count}"
+                        )
+                        chart = render_discipline_daily_goal_status_chart(
+                            status_df=report_df,
+                            chart_title=f"Discipline Daily Goal Status ({today.strftime('%m/%d/%Y')})",
+                            subtitle=subtitle,
+                        )
+
+                        await discipline_channel.send(f"<@{user_id}>, 15-minute post check-in discipline snapshot:")
+                        await discipline_channel.send(
+                            file=discord.File(fp=chart, filename="discipline_daily_goal_status_nightly.png")
+                        )
+                except Exception as e:
+                    print(f"Error sending nightly discipline visual: {e}")
+
+            last_discipline_visual_date = now.date()
 
         if now.weekday() == 6 and last_todo_weekly_visual_date != now.date():
             to_do_list_channel = get_todo_channel()
