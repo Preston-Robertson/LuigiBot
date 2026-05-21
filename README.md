@@ -17,13 +17,15 @@ A personal Discord bot for managing a to-do list and a separate discipline track
 
 ```text
 LuigiBot/
-|-- main.py                  # Bot instance, commands, scheduler, event handlers
-|-- bot_config.py            # Shared config (paths, channel IDs, prefix)
-|-- chart_rendering.py       # Visual theme + all chart rendering functions
-|-- discipline_helpers.py    # Discipline data processing, streaks, embeds
-|-- task_helpers.py          # To-do row builders, series builder, task embeds
-|-- ui_components.py         # Discord Button/View classes
-|-- required_functions.py    # Utility: extract_task_name
+|-- main.py                       # Bot instance, commands, scheduler, event handlers
+|-- bot_modules/                  # Helper package
+|   |-- __init__.py
+|   |-- bot_config.py             # Shared config (paths, channel IDs, prefix)
+|   |-- chart_rendering.py        # Visual theme + all chart rendering functions
+|   |-- discipline_helpers.py     # Discipline data processing, streaks, embeds
+|   |-- task_helpers.py           # To-do row builders, series builder, task embeds
+|   |-- ui_components.py          # Discord Button/View classes
+|   `-- required_functions.py     # Utility: extract_task_name
 |-- requirements.txt
 |-- config.json
 `-- to_do_list/

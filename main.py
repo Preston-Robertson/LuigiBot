@@ -12,7 +12,7 @@ import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 # --- Project Modules ---
-from bot_config import (
+from bot_modules.bot_config import (
     config,
     command_prefix,
     channel_id,
@@ -25,7 +25,7 @@ from bot_config import (
     discipline_daily_hour,
     discipline_daily_minute,
 )
-from task_helpers import (
+from bot_modules.task_helpers import (
     build_tracker_row,
     normalize_due_date,
     build_completed_task_series,
@@ -34,7 +34,7 @@ from task_helpers import (
     pause_task_tracking,
     build_task_detail_embed,
 )
-from discipline_helpers import (
+from bot_modules.discipline_helpers import (
     build_discipline_row,
     build_discipline_completion_row,
     ensure_discipline_dataframe_exists,
@@ -48,12 +48,12 @@ from discipline_helpers import (
     build_discipline_alert_summary,
     build_discipline_daily_embed,
 )
-from chart_rendering import (
+from bot_modules.chart_rendering import (
     render_completed_task_bar_chart,
     render_discipline_daily_goal_status_chart,
     render_discipline_weekly_progress_chart,
 )
-from ui_components import TaskSelectView, DisciplineTaskView
+from bot_modules.ui_components import TaskSelectView, DisciplineTaskView
 
 
 #%%

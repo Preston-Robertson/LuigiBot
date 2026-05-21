@@ -4,14 +4,14 @@ import datetime
 import discord
 import pandas as pd
 
-from bot_config import (
+from .bot_config import (
     command_prefix,
     path_for_to_do_list,
     path_for_discipline_list,
     path_for_discipline_completion_log,
 )
-from task_helpers import get_open_task_mask, pause_task_tracking, load_latest_task_row, build_task_detail_embed
-from discipline_helpers import (
+from .task_helpers import get_open_task_mask, pause_task_tracking, load_latest_task_row, build_task_detail_embed
+from .discipline_helpers import (
     ensure_discipline_dataframe_exists,
     ensure_discipline_completion_log_exists,
     build_discipline_completion_row,

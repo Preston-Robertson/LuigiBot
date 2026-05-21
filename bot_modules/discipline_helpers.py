@@ -5,7 +5,7 @@ import datetime
 import discord
 import pandas as pd
 
-from bot_config import (
+from .bot_config import (
     command_prefix,
     path_for_discipline_list,
     path_for_discipline_completion_log,

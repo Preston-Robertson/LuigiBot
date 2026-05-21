@@ -4,7 +4,7 @@ import datetime
 import discord
 import pandas as pd
 
-from bot_config import path_for_to_do_list
+from .bot_config import path_for_to_do_list
 
 
 # --- Row Builder ---
