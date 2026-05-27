@@ -70,6 +70,11 @@ from bot_modules.chart_rendering import (
     render_discipline_category_rollup_chart,
     render_discipline_heatmap_chart,
 )
+from bot_modules.follow_up_helpers import (
+    load_follow_ups,
+    add_follow_up as add_follow_up_mapping,
+    delete_follow_up as delete_follow_up_mapping,
+)
 from bot_modules.ui_components import TaskSelectView, DisciplineTaskView
 
 
@@ -140,6 +145,9 @@ async def on_ready():
                 f"`{command_prefix}tasks field:value ...` — Search/filter open tasks (e.g. `category:Health priority:>=7 due:week`)\n"
                 f"`{command_prefix}to_do_completion_visual` — Post a 7-day completed-task bar chart to the to-do channel\n"
                 f"`{command_prefix}to_do_weekly_visual [week_end]` — Post an end-of-week bar chart to the to-do channel (optional YYYYMMDD)\n"
+                f"`/add_follow_up` or `{command_prefix}add_follow_up <trigger> <follow_up> [catagory] [priority] [due_offset_days] [estimated_time] [link]` — Auto-create a follow-up task when a trigger task is completed (e.g. Do Dishes → Put up Dishes)\n"
+                f"`{command_prefix}follow_ups` — List configured trigger → follow-up mappings\n"
+                f"`{command_prefix}delete_follow_up <id>` — Delete a follow-up mapping by id\n"
             ),
             inline=False,
         )
@@ -676,6 +684,126 @@ async def delete_task(ctx, task_id):
         return
 
     await ctx.send(f"Deleted open task '{task_name}' (id {position}). Past completions of this task remain in history.", delete_after=60)
+
+
+# %%
+# FOLLOW-UP TASK COMMANDS
+# When a trigger task is completed via the Complete button, every mapping with a matching
+# TRIGGER_TASK auto-creates a new task in the to-do list (e.g. Do Dishes -> Put up Dishes).
+
+@bot.hybrid_command(
+    name="add_follow_up",
+    description="Auto-create a follow-up task when a trigger task is completed (e.g. Do Dishes -> Put up Dishes)",
+)
+@app_commands.describe(
+    trigger_task="The task name that, when completed, triggers the follow-up",
+    follow_up_task="The follow-up task to auto-create",
+    catagory="Category for the follow-up task (defaults to trigger task's category)",
+    priority="Priority 1-10 for the follow-up (default 1)",
+    due_offset_days="Days from completion to set as due date (optional)",
+    estimated_time="Estimated hours for the follow-up (optional)",
+    relevant_link="Link to attach to the follow-up (optional)",
+)
+async def add_follow_up(
+    ctx,
+    trigger_task,
+    follow_up_task,
+    catagory=None,
+    priority=1,
+    due_offset_days=None,
+    estimated_time=None,
+    relevant_link=None,
+):
+    try:
+        new_row = add_follow_up_mapping(
+            trigger_task=trigger_task,
+            follow_up_task=follow_up_task,
+            catagory=catagory,
+            priority=priority,
+            due_offset_days=due_offset_days,
+            estimated_time=estimated_time,
+            relevant_link=relevant_link,
+        )
+    except ValueError as exc:
+        await ctx.send(f"Could not add follow-up: {exc}", delete_after=60)
+        return
+    except Exception as e:
+        await ctx.send(f"Something went wrong: {e}", delete_after=60)
+        return
+
+    due_note = f" (due +{int(new_row['DUE_OFFSET_DAYS'])}d)" if pd.notna(new_row.get("DUE_OFFSET_DAYS")) else ""
+    await ctx.send(
+        f"Added follow-up: '{new_row['TRIGGER_TASK']}' → '{new_row['FOLLOW_UP_TASK']}'{due_note}",
+        delete_after=60,
+    )
+
+
+@bot.command(name="follow_ups", help="List all configured trigger → follow-up task mappings")
+async def follow_ups(ctx):
+    try:
+        df = load_follow_ups()
+    except Exception as e:
+        await ctx.send(f"Could not read follow-up mappings: {e}", delete_after=60)
+        return
+
+    embed = discord.Embed(title="Follow-Up Task Mappings", color=0xE67E22)
+    if df.empty:
+        embed.add_field(
+            name="No mappings configured",
+            value=f"Use `{command_prefix}add_follow_up <trigger> <follow_up>` to create one.",
+            inline=False,
+        )
+        await ctx.send(embed=embed, delete_after=120)
+        return
+
+    for count, (_, row) in enumerate(df.iterrows()):
+        if count >= 20:
+            break
+        catagory = row.get("CATAGORY")
+        priority = row.get("PRIORITY")
+        offset = row.get("DUE_OFFSET_DAYS")
+        lines = [f"Trigger: {row['TRIGGER_TASK']}"]
+        if catagory and not pd.isna(catagory):
+            lines.append(f"Category: {catagory}")
+        if priority is not None and not pd.isna(priority):
+            lines.append(f"Priority: {int(priority)}")
+        if offset is not None and not pd.isna(offset):
+            lines.append(f"Due offset: +{int(offset)} day(s) from completion")
+        embed.add_field(
+            name=f"{count + 1}. → {row['FOLLOW_UP_TASK']}",
+            value="\n".join(lines),
+            inline=False,
+        )
+
+    if len(df) > 20:
+        embed.set_footer(text=f"Showing first 20 of {len(df)} mappings.")
+    else:
+        embed.set_footer(text=f"Total mappings: {len(df)} | Delete with {command_prefix}delete_follow_up <id>")
+
+    await ctx.send(embed=embed, delete_after=120)
+
+
+@bot.command(name="delete_follow_up", help="Delete a follow-up mapping by id from !L follow_ups")
+async def delete_follow_up(ctx, mapping_id):
+    try:
+        position = int(mapping_id)
+    except ValueError:
+        await ctx.send("Mapping id must be the number shown in `!L follow_ups`.", delete_after=60)
+        return
+
+    try:
+        removed = delete_follow_up_mapping(position)
+    except ValueError as exc:
+        await ctx.send(str(exc), delete_after=60)
+        return
+    except Exception as e:
+        await ctx.send(f"Could not delete mapping: {e}", delete_after=60)
+        return
+
+    await ctx.send(
+        f"Deleted follow-up mapping: '{removed['TRIGGER_TASK']}' → '{removed['FOLLOW_UP_TASK']}'.",
+        delete_after=60,
+    )
 
 
 @bot.command(

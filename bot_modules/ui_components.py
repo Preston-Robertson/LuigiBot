@@ -10,6 +10,7 @@ from .bot_config import (
     path_for_discipline_list,
 )
 from .task_helpers import get_open_task_mask, pause_task_tracking, load_latest_task_row, build_task_detail_embed
+from .follow_up_helpers import create_follow_up_tasks_for
 from .discipline_helpers import (
     ensure_discipline_dataframe_exists,
     ensure_discipline_history_exists,
@@ -109,6 +110,14 @@ class TaskActionView(discord.ui.View):
         to_do_list_df.loc[task_mask, "STATUS"] = "Completed"
         to_do_list_df.to_pickle(path_for_to_do_list)
 
+        # Auto-create any follow-up tasks tied to this trigger (e.g. Do Dishes -> Put up Dishes).
+        created_follow_ups = []
+        try:
+            completed_row = to_do_list_df.loc[task_mask].iloc[0]
+            created_follow_ups = create_follow_up_tasks_for(self.task_name, source_row=completed_row)
+        except Exception as e:
+            print(f"Error creating follow-up tasks for '{self.task_name}': {e}")
+
         try:
             task_row = load_latest_task_row(self.task_name)
             if task_row is None:
@@ -116,6 +125,12 @@ class TaskActionView(discord.ui.View):
                 return
 
             embed = build_task_detail_embed(task_row)
+            if created_follow_ups:
+                embed.add_field(
+                    name="🔁 Follow-ups Created",
+                    value="\n".join(f"• {name}" for name in created_follow_ups),
+                    inline=False,
+                )
 
             await interaction.response.edit_message(embed=embed, view=None)
             msg = await interaction.original_response()

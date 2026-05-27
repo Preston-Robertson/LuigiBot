@@ -12,6 +12,7 @@ user_id = config["User_ID"]
 
 path_for_to_do_list = "to_do_list\\to_do_list.pkl"
 path_for_recurring_tasks = "to_do_list\\recurring_tasks.pkl"
+path_for_follow_up_tasks = config.get("Follow_Up_Tasks_Path", "to_do_list\\follow_up_tasks.pkl")
 path_for_discipline_list = config.get("Discipline_List_Path", "to_do_list\\discipline_list.pkl")
 path_for_discipline_completion_log = config.get("Discipline_Completion_Log_Path", "to_do_list\\discipline_completion_log.pkl")
 path_for_discipline_history = config.get("Discipline_History_Path", "to_do_list\\discipline_history.pkl")
