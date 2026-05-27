@@ -8,14 +8,14 @@ from .bot_config import (
     command_prefix,
     path_for_to_do_list,
     path_for_discipline_list,
-    path_for_discipline_completion_log,
 )
 from .task_helpers import get_open_task_mask, pause_task_tracking, load_latest_task_row, build_task_detail_embed
 from .discipline_helpers import (
     ensure_discipline_dataframe_exists,
-    ensure_discipline_completion_log_exists,
-    build_discipline_completion_row,
-    get_task_completed_today,
+    ensure_discipline_history_exists,
+    read_discipline_history,
+    set_discipline_cell,
+    is_task_completed_on,
 )
 
 
@@ -145,17 +145,7 @@ class TaskActionView(discord.ui.View):
         to_do_list_df.loc[task_mask, "STATUS"] = "Hiatus"
         await self._persist_and_ack(interaction, to_do_list_df, f"Updated '{self.task_name}' to 'Hiatus'")
 
-    @discord.ui.button(label="Snooze 1h", style=discord.ButtonStyle.secondary, emoji="⏰")
-    async def snooze_task(self, interaction: discord.Interaction, button: discord.ui.Button):
-        due_date = datetime.datetime.now() + datetime.timedelta(hours=1)
-        await self._defer_task(interaction, due_date, "in 1 hour")
-
-    @discord.ui.button(label="Tomorrow", style=discord.ButtonStyle.secondary, emoji="📅")
-    async def move_to_tomorrow(self, interaction: discord.Interaction, button: discord.ui.Button):
-        tomorrow = datetime.datetime.now().date() + datetime.timedelta(days=1)
-        await self._defer_task(interaction, tomorrow, "tomorrow")
-
-    @discord.ui.button(label="Weekend", style=discord.ButtonStyle.secondary, emoji="🗓️", row=1)
+    @discord.ui.button(label="Weekend", style=discord.ButtonStyle.secondary, emoji="🗓️")
     async def move_to_weekend(self, interaction: discord.Interaction, button: discord.ui.Button):
         today = datetime.datetime.now().date()
         days_until_saturday = (5 - today.weekday()) % 7
@@ -175,43 +165,37 @@ class DisciplineTaskButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction):
         ensure_discipline_dataframe_exists()
-        ensure_discipline_completion_log_exists()
+        ensure_discipline_history_exists()
 
         today = pd.to_datetime(datetime.datetime.now().date()).normalize()
-        completion_df = pd.read_pickle(path_for_discipline_completion_log)
-        is_logged = get_task_completed_today(self.task_name, completion_df, today)
+        history_df = read_discipline_history()
+        is_logged = is_task_completed_on(self.task_name, today, history_df)
+
+        # Verify task still exists in the discipline list before creating a new column.
+        discipline_df = pd.read_pickle(path_for_discipline_list)
+        task_match = discipline_df[discipline_df["TASK"].astype(str).str.lower() == str(self.task_name).strip().lower()]
+        if task_match.empty and not is_logged:
+            await interaction.response.send_message(
+                f"❌ Task not found. Use {command_prefix}discipline_list to view tracked items.",
+                ephemeral=True,
+                delete_after=30,
+            )
+            return
+
+        set_discipline_cell(self.task_name, today, not is_logged)
 
         if is_logged:
-            completion_df_filtered = completion_df[
-                ~((completion_df["TASK"].astype(str).str.lower() == str(self.task_name).strip().lower())
-                  & (completion_df["COMPLETED_DATE"] == today))
-            ]
-            completion_df_filtered.to_pickle(path_for_discipline_completion_log)
             await interaction.response.send_message(
                 f"✅ Marked '{self.task_name}' as incomplete for today.",
                 ephemeral=True,
                 delete_after=30,
             )
         else:
-            discipline_df = pd.read_pickle(path_for_discipline_list)
-            task_match = discipline_df[discipline_df["TASK"].astype(str).str.lower() == str(self.task_name).strip().lower()]
-            if not task_match.empty:
-                task_row = task_match.iloc[0]
-                catagory = str(task_row["CATAGORY"])
-                completion_row = build_discipline_completion_row(self.task_name, catagory, today)
-                updated_df = pd.concat([completion_df, completion_row], ignore_index=True)
-                updated_df.to_pickle(path_for_discipline_completion_log)
-                await interaction.response.send_message(
-                    f"✅ Logged '{self.task_name}' as completed for today.",
-                    ephemeral=True,
-                    delete_after=30,
-                )
-            else:
-                await interaction.response.send_message(
-                    f"❌ Task not found. Use {command_prefix}discipline_list to view tracked items.",
-                    ephemeral=True,
-                    delete_after=30,
-                )
+            await interaction.response.send_message(
+                f"✅ Logged '{self.task_name}' as completed for today.",
+                ephemeral=True,
+                delete_after=30,
+            )
 
 
 class DisciplineTaskView(discord.ui.View):

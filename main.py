@@ -20,10 +20,12 @@ from bot_modules.bot_config import (
     path_for_to_do_list,
     path_for_recurring_tasks,
     path_for_discipline_list,
-    path_for_discipline_completion_log,
     discipline_delete_after_seconds,
     discipline_daily_hour,
     discipline_daily_minute,
+    discipline_at_risk_weekday,
+    discipline_at_risk_hour,
+    discipline_at_risk_minute,
 )
 from bot_modules.task_helpers import (
     build_tracker_row,
@@ -33,12 +35,18 @@ from bot_modules.task_helpers import (
     load_latest_task_row,
     pause_task_tracking,
     build_task_detail_embed,
+    resolve_task_index_from_position,
+    parse_field_value_pairs,
+    apply_task_field_updates,
+    EDITABLE_TASK_FIELDS,
+    parse_task_filter_tokens,
+    filter_tasks,
+    FILTERABLE_TASK_FIELDS,
 )
 from bot_modules.discipline_helpers import (
     build_discipline_row,
-    build_discipline_completion_row,
     ensure_discipline_dataframe_exists,
-    ensure_discipline_completion_log_exists,
+    ensure_discipline_history_exists,
     normalize_discipline_completion_df,
     build_discipline_weekly_counts,
     get_active_discipline_df,
@@ -47,11 +55,20 @@ from bot_modules.discipline_helpers import (
     build_discipline_insight_df,
     build_discipline_alert_summary,
     build_discipline_daily_embed,
+    build_discipline_progress_embed,
+    build_discipline_category_rollup_df,
+    build_discipline_at_risk_embed,
+    read_discipline_history,
+    set_discipline_cell,
+    is_task_completed_on,
+    load_discipline_completion_df,
 )
 from bot_modules.chart_rendering import (
     render_completed_task_bar_chart,
     render_discipline_daily_goal_status_chart,
     render_discipline_weekly_progress_chart,
+    render_discipline_category_rollup_chart,
+    render_discipline_heatmap_chart,
 )
 from bot_modules.ui_components import TaskSelectView, DisciplineTaskView
 
@@ -65,6 +82,7 @@ last_discipline_daily_date = None
 last_discipline_visual_date = None
 last_todo_visual_date = None
 last_todo_weekly_visual_date = None
+last_discipline_at_risk_date = None
 
 
 def get_discipline_channel():
@@ -101,7 +119,7 @@ async def on_ready():
         print(f"Error syncing commands: {e}")
     
     ensure_discipline_dataframe_exists()
-    ensure_discipline_completion_log_exists()
+    ensure_discipline_history_exists()
     send_daily_message.start()
 
     if luigi_channel:
@@ -118,6 +136,9 @@ async def on_ready():
                 "`/hello` — Greeting test command\n"
                 f"`/to_do_list` or `{command_prefix}to_do_list` — View active to-do items (sorted by priority & due date)\n"
                 f"`/create_task` or `{command_prefix}create_task` — Create a new to-do task with metadata (priority, due date, estimated time, etc.)\n"
+                f"`{command_prefix}edit_task <id> field=value ...` — Edit fields on an open task (priority, due_date, task_name, category, group, subgroup, link, status, estimated_time)\n"
+                f"`{command_prefix}delete_task <id>` — Delete an open task by id (history preserved)\n"
+                f"`{command_prefix}tasks field:value ...` — Search/filter open tasks (e.g. `category:Health priority:>=7 due:week`)\n"
                 f"`{command_prefix}to_do_completion_visual` — Post a 7-day completed-task bar chart to the to-do channel\n"
                 f"`{command_prefix}to_do_weekly_visual [week_end]` — Post an end-of-week bar chart to the to-do channel (optional YYYYMMDD)\n"
             ),
@@ -133,8 +154,12 @@ async def on_ready():
                 f"`{command_prefix}today_completions` — View today's logged discipline completions (or any date)\n"
                 f"`{command_prefix}weekly_discipline_summary` — Weekly progress report vs frequency targets\n"
                 f"`{command_prefix}discipline_streaks` — Current streaks, best streaks, and 4-week consistency scores\n"
+                f"`{command_prefix}discipline_progress [YYYYMMDD]` — Weekly partial-credit progress bars (X/Y) for each discipline\n"
+                f"`{command_prefix}at_risk [YYYYMMDD]` — List disciplines that won't hit their weekly target at current pace (auto-pings midweek)\n"
+                f"`{command_prefix}discipline_heatmap [days] [YYYYMMDD]` — Post a GitHub-style heatmap of daily discipline completions (default 90 days)\n"
                 f"`{command_prefix}daily_discipline_visual` — Post today's discipline goal-status visual to the discipline channel\n"
                 f"`{command_prefix}weekly_discipline_visual [week_start]` — Post weekly discipline progress visual to the discipline channel\n"
+                f"`{command_prefix}discipline_category_rollup [week_start]` — Post weekly category-level adherence chart to the discipline channel\n"
             ),
             inline=False,
         )
@@ -206,6 +231,7 @@ async def send_daily_message():
     global last_discipline_visual_date
     global last_todo_visual_date
     global last_todo_weekly_visual_date
+    global last_discipline_at_risk_date
 
     est = pytz.timezone('US/Eastern')
     now = datetime.datetime.now(est)
@@ -322,7 +348,7 @@ async def send_daily_message():
                 try:
                     discipline_list_df = pd.read_pickle(path_for_discipline_list)
                     discipline_df = get_active_discipline_df(discipline_list_df)
-                    completion_log_df = pd.read_pickle(path_for_discipline_completion_log)
+                    completion_log_df = load_discipline_completion_df()
                     embed = build_discipline_daily_embed(discipline_df, completion_log_df, now)
                     
                     today = pd.to_datetime(now.date()).normalize()
@@ -382,10 +408,10 @@ async def send_daily_message():
             if discipline_channel:
                 try:
                     ensure_discipline_dataframe_exists()
-                    ensure_discipline_completion_log_exists()
+                    ensure_discipline_history_exists()
 
                     discipline_df = pd.read_pickle(path_for_discipline_list)
-                    completion_df = pd.read_pickle(path_for_discipline_completion_log)
+                    completion_df = load_discipline_completion_df()
 
                     if not discipline_df.empty:
                         today = pd.to_datetime(now.date()).normalize()
@@ -479,6 +505,35 @@ async def send_daily_message():
 
             last_todo_weekly_visual_date = now.date()
 
+    if (
+        now.weekday() == discipline_at_risk_weekday
+        and now.hour == discipline_at_risk_hour
+        and now.minute == discipline_at_risk_minute
+        and last_discipline_at_risk_date != now.date()
+    ):
+        discipline_channel = get_discipline_channel()
+        if discipline_channel:
+            try:
+                ensure_discipline_dataframe_exists()
+                ensure_discipline_history_exists()
+                discipline_df = pd.read_pickle(path_for_discipline_list)
+                completion_df = load_discipline_completion_df()
+                reference_day = pd.to_datetime(now.date()).normalize()
+                embed = build_discipline_at_risk_embed(
+                    discipline_df, completion_df, reference_date=reference_day
+                )
+                await discipline_channel.send(
+                    f"<@{user_id}> Midweek discipline check ({now.strftime('%a %I:%M %p ET')}):",
+                    delete_after=discipline_delete_after_seconds,
+                )
+                await discipline_channel.send(
+                    embed=embed,
+                    delete_after=discipline_delete_after_seconds,
+                )
+            except Exception as e:
+                print(f"Error sending midweek at-risk nudge: {e}")
+        last_discipline_at_risk_date = now.date()
+
 
 
 
@@ -562,6 +617,147 @@ async def create_task(ctx,
         await ctx.send("Added", delete_after=60)
     except Exception as e:
         await ctx.send(f"Something went wrong: {e}")
+
+
+@bot.command(
+    name="edit_task",
+    help='Edit fields on an open task. Usage: !L edit_task <id> field=value [field=value ...]'
+)
+async def edit_task(ctx, task_id, *, updates: str = ""):
+    try:
+        position = int(task_id)
+    except ValueError:
+        await ctx.send("Task id must be the number shown in `!L to_do_list`.", delete_after=60)
+        return
+
+    if not updates.strip():
+        allowed = ", ".join(sorted(set(EDITABLE_TASK_FIELDS)))
+        await ctx.send(
+            f"Provide at least one `field=value` pair. Allowed fields: {allowed}",
+            delete_after=90,
+        )
+        return
+
+    try:
+        to_do_list_df = pd.read_pickle(path_for_to_do_list)
+    except Exception as e:
+        await ctx.send(f"Could not read to-do list: {e}", delete_after=60)
+        return
+
+    df_index, target_row = resolve_task_index_from_position(to_do_list_df, position)
+    if df_index is None:
+        await ctx.send(f"No open task at position {position}. Run `!L to_do_list` to see current ids.", delete_after=60)
+        return
+
+    try:
+        pairs = parse_field_value_pairs(updates)
+        applied = apply_task_field_updates(to_do_list_df, df_index, pairs)
+    except ValueError as exc:
+        await ctx.send(f"Edit failed: {exc}", delete_after=90)
+        return
+
+    try:
+        to_do_list_df.to_pickle(path_for_to_do_list)
+    except Exception as e:
+        await ctx.send(f"Could not save updates: {e}", delete_after=60)
+        return
+
+    task_name = str(target_row["TASK"])
+    summary_lines = [f"Updated '{task_name}' (id {position}):"]
+    for column, value in applied:
+        display_val = value
+        if column == "DUE DATE" and not pd.isna(pd.to_datetime(value, errors="coerce")):
+            display_val = pd.to_datetime(value).strftime("%m/%d/%Y")
+        summary_lines.append(f"  - {column}: {display_val}")
+    await ctx.send("\n".join(summary_lines), delete_after=90)
+
+
+@bot.command(
+    name="delete_task",
+    help="Delete an open task by its id from !L to_do_list. Historical completed rows are not touched."
+)
+async def delete_task(ctx, task_id):
+    try:
+        position = int(task_id)
+    except ValueError:
+        await ctx.send("Task id must be the number shown in `!L to_do_list`.", delete_after=60)
+        return
+
+    try:
+        to_do_list_df = pd.read_pickle(path_for_to_do_list)
+    except Exception as e:
+        await ctx.send(f"Could not read to-do list: {e}", delete_after=60)
+        return
+
+    df_index, target_row = resolve_task_index_from_position(to_do_list_df, position)
+    if df_index is None:
+        await ctx.send(f"No open task at position {position}. Run `!L to_do_list` to see current ids.", delete_after=60)
+        return
+
+    task_name = str(target_row["TASK"])
+    to_do_list_df = to_do_list_df.drop(index=df_index)
+
+    try:
+        to_do_list_df.to_pickle(path_for_to_do_list)
+    except Exception as e:
+        await ctx.send(f"Could not save after delete: {e}", delete_after=60)
+        return
+
+    await ctx.send(f"Deleted open task '{task_name}' (id {position}). Past completions of this task remain in history.", delete_after=60)
+
+
+@bot.command(
+    name="tasks",
+    help="Filter the to-do list. Usage: !L tasks field:value [field:value ...] (e.g. category:Health priority:>=7 due:week)"
+)
+async def tasks(ctx, *, filters: str = ""):
+    try:
+        to_do_list_df = pd.read_pickle(path_for_to_do_list)
+    except Exception as e:
+        await ctx.send(f"Could not read to-do list: {e}", delete_after=60)
+        return
+
+    try:
+        filter_tokens = parse_task_filter_tokens(filters)
+        filtered_df = filter_tasks(to_do_list_df, filter_tokens)
+    except ValueError as exc:
+        allowed = ", ".join(sorted(set(FILTERABLE_TASK_FIELDS)))
+        await ctx.send(f"Filter error: {exc}\nAllowed fields: {allowed}", delete_after=120)
+        return
+
+    filter_summary = " ".join(f"{k}:{v}" for k, v in filter_tokens) if filter_tokens else "(no filters)"
+    total_matches = len(filtered_df)
+
+    embed = discord.Embed(
+        title=f"To-Do Search Results ({total_matches})",
+        description=f"Filters: `{filter_summary}`",
+        color=0x00FF00,
+    )
+
+    if total_matches == 0:
+        embed.add_field(name="No matches", value="Try loosening your filters.", inline=False)
+        await ctx.channel.send(embed=embed, delete_after=90)
+        return
+
+    display_df = filtered_df.head(20).loc[:, ["TASK", "PRIORITY", "STATUS", "DUE DATE", "RELEVANT LINK", "CATAGORY"]].astype(str)
+    for count, (_, row) in enumerate(display_df.iterrows()):
+        task_name = row["TASK"]
+        due = row["DUE DATE"] if row["DUE DATE"] != "NaT" else "No due date"
+        link = row["RELEVANT LINK"]
+        link_md = f"[LINK]({link})" if link and link not in ("None", "nan") else "No link"
+        value = (
+            f"Priority: {row['PRIORITY']}\n"
+            f"Status: {row['STATUS']}\n"
+            f"Category: {row['CATAGORY']}\n"
+            f"Due: {due}\n"
+            f"{link_md}"
+        )
+        embed.add_field(name=f"{count + 1}. {task_name}", value=value, inline=False)
+
+    if total_matches > 20:
+        embed.set_footer(text=f"Showing first 20 of {total_matches} matches.")
+
+    await ctx.channel.send(embed=embed, delete_after=120)
 
 
 @bot.command(name="to_do_completion_visual", help="Post a 7-day to-do completion bar chart to the to-do channel")
@@ -741,7 +937,7 @@ def calculate_streak(task_name, completion_df, reference_date=None):
 @bot.command(name = "log_discipline_completion", help= "Log a completed discipline item for data collection")
 async def log_discipline_completion(ctx, task_name, completed_date=None):
     ensure_discipline_dataframe_exists()
-    ensure_discipline_completion_log_exists()
+    ensure_discipline_history_exists()
 
     discipline_df = pd.read_pickle(path_for_discipline_list)
     task_match = discipline_df[discipline_df["TASK"].astype(str).str.lower() == str(task_name).strip().lower()]
@@ -751,7 +947,7 @@ async def log_discipline_completion(ctx, task_name, completed_date=None):
         return
 
     task_row = task_match.iloc[0]
-    catagory = str(task_row["CATAGORY"])
+    canonical_task_name = str(task_row["TASK"])
 
     if completed_date in (None, ""):
         target_completed_date = datetime.datetime.now().date()
@@ -763,36 +959,25 @@ async def log_discipline_completion(ctx, task_name, completed_date=None):
             return
 
     target_completed_date_normalized = pd.to_datetime(target_completed_date).normalize()
-    
-    # Check for duplicate entry
-    completion_df = pd.read_pickle(path_for_discipline_completion_log)
-    duplicate_check = completion_df[
-        (completion_df["TASK"].astype(str).str.lower() == str(task_name).strip().lower())
-        & (completion_df["COMPLETED_DATE"] == target_completed_date_normalized)
-    ]
-    
-    if not duplicate_check.empty:
-        await ctx.send(f"'{task_row['TASK']}' has already been logged for {target_completed_date_normalized.strftime('%m/%d/%Y')}.", delete_after=60)
+
+    if is_task_completed_on(canonical_task_name, target_completed_date_normalized):
+        await ctx.send(
+            f"'{canonical_task_name}' has already been logged for {target_completed_date_normalized.strftime('%m/%d/%Y')}.",
+            delete_after=60,
+        )
         return
 
-    completion_row = build_discipline_completion_row(task_name=task_row["TASK"], catagory=catagory, completed_date=target_completed_date)
+    set_discipline_cell(canonical_task_name, target_completed_date_normalized, True)
 
-    try:
-        completion_df = pd.read_pickle(path_for_discipline_completion_log)
-    except FileNotFoundError:
-        completion_df = completion_row.iloc[0:0]
-
-    updated_completion_df = pd.concat([completion_df, completion_row], ignore_index=True)
-    updated_completion_df.to_pickle(path_for_discipline_completion_log)
-    
-    # Update streak for this task
-    new_streak = calculate_streak(task_row["TASK"], updated_completion_df, reference_date=target_completed_date)
+    # Recompute and persist CURRENT_STREAK for convenience (display uses matrix-derived values).
+    updated_completion_df = load_discipline_completion_df()
+    new_streak = calculate_streak(canonical_task_name, updated_completion_df, reference_date=target_completed_date_normalized)
     discipline_df.loc[task_match.index, "CURRENT_STREAK"] = new_streak
     discipline_df.to_pickle(path_for_discipline_list)
 
-    logged_date = pd.to_datetime(completion_row["COMPLETED_DATE"].iloc[0]).strftime("%m/%d/%Y")
+    logged_date = target_completed_date_normalized.strftime("%m/%d/%Y")
     streak_msg = f" (Streak: {new_streak} day(s))" if new_streak > 0 else ""
-    await ctx.send(f"Logged completion for '{task_row['TASK']}' on {logged_date}.{streak_msg}", delete_after=60)
+    await ctx.send(f"Logged completion for '{canonical_task_name}' on {logged_date}.{streak_msg}", delete_after=60)
 
 
 @bot.command(name = "deactivate_discipline_task", help= "Deactivate a discipline task (hide it from the list without deleting)")
@@ -842,7 +1027,7 @@ async def update_discipline_frequency(ctx, task_name, new_frequency):
 
 @bot.command(name = "today_completions", help= "View discipline items you've logged as completed today")
 async def today_completions(ctx, date=None):
-    ensure_discipline_completion_log_exists()
+    ensure_discipline_history_exists()
 
     if date in (None, ""):
         target_date = pd.to_datetime(datetime.datetime.now().date()).normalize()
@@ -855,40 +1040,46 @@ async def today_completions(ctx, date=None):
             await ctx.send(f"Invalid date format. Use YYYYMMDD (e.g., 20260511).", delete_after=60)
             return
 
-    completion_df = pd.read_pickle(path_for_discipline_completion_log)
-    today_logged = completion_df[completion_df["COMPLETED_DATE"] == target_date].copy()
-
+    history_df = read_discipline_history()
     embed = discord.Embed(
         title=f"Discipline Completions - {display_date}",
         description="Items logged as completed on this date.",
         color=0x3498DB,
     )
 
-    if today_logged.empty:
+    if history_df.empty or target_date not in history_df.index:
         embed.add_field(name="No Completions Logged", value="No items logged for this date.", inline=False)
         await ctx.send(embed=embed, delete_after=120)
         return
 
-    count = 0
-    grouped_by_task = today_logged.groupby("TASK").agg({
-        "CATAGORY": "first",
-        "LOGGED_AT": "min",
-    }).reset_index()
+    row = history_df.loc[target_date]
+    completed_tasks = [task for task, val in row.items() if (not pd.isna(val)) and bool(val)]
 
-    for _, row in grouped_by_task.iterrows():
-        if count >= 20:
-            break
-        task_name = str(row["TASK"])
-        catagory = str(row["CATAGORY"])
-        logged_at = pd.to_datetime(row["LOGGED_AT"]).strftime("%I:%M %p")
-        value = f"Category: {catagory}\nLogged at: {logged_at}"
-        embed.add_field(name=f"{count + 1}. {task_name}", value=value, inline=False)
-        count += 1
+    if not completed_tasks:
+        embed.add_field(name="No Completions Logged", value="No items logged for this date.", inline=False)
+        await ctx.send(embed=embed, delete_after=120)
+        return
 
-    if len(grouped_by_task) > 20:
-        embed.set_footer(text=f"Showing top 20 of {len(grouped_by_task)} completions")
+    # Pull category from discipline_list for nicer display
+    try:
+        discipline_df = pd.read_pickle(path_for_discipline_list)
+        cat_map = dict(
+            zip(
+                discipline_df["TASK"].astype(str).str.strip(),
+                discipline_df["CATAGORY"].astype(str),
+            )
+        )
+    except Exception:
+        cat_map = {}
+
+    for count, task_name in enumerate(completed_tasks[:20]):
+        catagory = cat_map.get(str(task_name).strip(), "Discipline")
+        embed.add_field(name=f"{count + 1}. {task_name}", value=f"Category: {catagory}", inline=False)
+
+    if len(completed_tasks) > 20:
+        embed.set_footer(text=f"Showing top 20 of {len(completed_tasks)} completions")
     else:
-        embed.set_footer(text=f"Total logged: {len(grouped_by_task)}")
+        embed.set_footer(text=f"Total logged: {len(completed_tasks)}")
 
     await ctx.send(embed=embed, delete_after=120)
 
@@ -896,7 +1087,7 @@ async def today_completions(ctx, date=None):
 @bot.command(name = "weekly_discipline_summary", help= "Weekly discipline progress vs frequency targets")
 async def weekly_discipline_summary(ctx, week_start=None):
     ensure_discipline_dataframe_exists()
-    ensure_discipline_completion_log_exists()
+    ensure_discipline_history_exists()
 
     discipline_df = pd.read_pickle(path_for_discipline_list)
     if discipline_df.empty:
@@ -916,7 +1107,7 @@ async def weekly_discipline_summary(ctx, week_start=None):
 
     end_date = start_date + pd.Timedelta(days=6)
 
-    completion_df = pd.read_pickle(path_for_discipline_completion_log)
+    completion_df = load_discipline_completion_df()
     reference_day = min(today, end_date)
     report_df = build_discipline_insight_df(discipline_df, completion_df, start_date, end_date, reference_date=reference_day)
 
@@ -969,14 +1160,14 @@ async def weekly_discipline_summary(ctx, week_start=None):
 @bot.command(name="discipline_streaks", help="Current streaks, longest streaks, and recent discipline consistency")
 async def discipline_streaks(ctx):
     ensure_discipline_dataframe_exists()
-    ensure_discipline_completion_log_exists()
+    ensure_discipline_history_exists()
 
     discipline_df = pd.read_pickle(path_for_discipline_list)
     if discipline_df.empty:
         await ctx.send("No discipline tasks are currently tracked.", delete_after=60)
         return
 
-    completion_df = pd.read_pickle(path_for_discipline_completion_log)
+    completion_df = load_discipline_completion_df()
     today = pd.to_datetime(datetime.datetime.now().date()).normalize()
     week_start = today - pd.Timedelta(days=int(today.weekday()))
     week_end = week_start + pd.Timedelta(days=6)
@@ -1010,10 +1201,60 @@ async def discipline_streaks(ctx):
     await ctx.send(embed=embed, delete_after=180)
 
 
+@bot.command(
+    name="discipline_progress",
+    aliases=["discipline_bar", "discipline_status"],
+    help="Show weekly partial-credit progress bars for each discipline (X/Y with bar + percent).",
+)
+async def discipline_progress(ctx, reference_date=None):
+    ensure_discipline_dataframe_exists()
+    ensure_discipline_history_exists()
+
+    if reference_date in (None, ""):
+        reference_day = pd.to_datetime(datetime.datetime.now().date()).normalize()
+    else:
+        try:
+            reference_day = pd.to_datetime(reference_date).normalize()
+        except Exception:
+            await ctx.send("Invalid date format. Use YYYYMMDD (e.g., 20260511).", delete_after=60)
+            return
+
+    discipline_df = pd.read_pickle(path_for_discipline_list)
+    completion_df = load_discipline_completion_df()
+    embed = build_discipline_progress_embed(discipline_df, completion_df, reference_date=reference_day)
+
+    await ctx.send(embed=embed, delete_after=180)
+
+
+@bot.command(
+    name="at_risk",
+    aliases=["discipline_at_risk", "midweek_check"],
+    help="List disciplines that won't hit their weekly target at current pace (plus a 'tight' tier).",
+)
+async def at_risk(ctx, reference_date=None):
+    ensure_discipline_dataframe_exists()
+    ensure_discipline_history_exists()
+
+    if reference_date in (None, ""):
+        reference_day = pd.to_datetime(datetime.datetime.now().date()).normalize()
+    else:
+        try:
+            reference_day = pd.to_datetime(reference_date).normalize()
+        except Exception:
+            await ctx.send("Invalid date format. Use YYYYMMDD (e.g., 20260511).", delete_after=60)
+            return
+
+    discipline_df = pd.read_pickle(path_for_discipline_list)
+    completion_df = load_discipline_completion_df()
+    embed = build_discipline_at_risk_embed(discipline_df, completion_df, reference_date=reference_day)
+
+    await ctx.send(embed=embed, delete_after=180)
+
+
 @bot.command(name="daily_discipline_visual", aliases=["discipline_daily_visual"], help="Post today's discipline goal-status visual to the discipline channel")
 async def daily_discipline_visual(ctx):
     ensure_discipline_dataframe_exists()
-    ensure_discipline_completion_log_exists()
+    ensure_discipline_history_exists()
 
     try:
         await ctx.message.delete()
@@ -1034,7 +1275,7 @@ async def daily_discipline_visual(ctx):
     week_start = today - pd.Timedelta(days=int(today.weekday()))
     week_end = week_start + pd.Timedelta(days=6)
 
-    completion_df = pd.read_pickle(path_for_discipline_completion_log)
+    completion_df = load_discipline_completion_df()
     report_df = build_discipline_weekly_counts(discipline_df, completion_df, week_start, week_end)
 
     # Build state flags to match the daily visual intent.
@@ -1095,7 +1336,7 @@ async def daily_discipline_visual(ctx):
 @bot.command(name="weekly_discipline_visual", aliases=["discipline_weekly_visual", "weekly_discipline_report"], help="Post weekly discipline progress visual to the discipline channel")
 async def weekly_discipline_visual(ctx, week_start=None):
     ensure_discipline_dataframe_exists()
-    ensure_discipline_completion_log_exists()
+    ensure_discipline_history_exists()
 
     try:
         await ctx.message.delete()
@@ -1124,7 +1365,7 @@ async def weekly_discipline_visual(ctx, week_start=None):
             return
 
     end_date = start_date + pd.Timedelta(days=6)
-    completion_df = pd.read_pickle(path_for_discipline_completion_log)
+    completion_df = load_discipline_completion_df()
     report_df = build_discipline_weekly_counts(discipline_df, completion_df, start_date, end_date)
 
     total_target = int(report_df["FREQUENCY_PER_WEEK"].sum())
@@ -1143,6 +1384,167 @@ async def weekly_discipline_visual(ctx, week_start=None):
 
     if ctx.channel.id != discipline_channel.id:
         await ctx.send("Posted the discipline weekly visual in the discipline channel.", delete_after=300)
+
+
+@bot.command(
+    name="discipline_category_rollup",
+    aliases=["category_rollup", "discipline_categories"],
+    help="Post a weekly category-level adherence chart (e.g. Focus 90%, Health 60%) to the discipline channel.",
+)
+async def discipline_category_rollup(ctx, week_start=None):
+    ensure_discipline_dataframe_exists()
+    ensure_discipline_history_exists()
+
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+
+    discipline_channel = get_discipline_channel()
+    if not discipline_channel:
+        await ctx.send("Discipline channel not found. Please verify Channel_ID_discipline in config.", delete_after=60)
+        return
+
+    discipline_df = pd.read_pickle(path_for_discipline_list)
+    if discipline_df.empty:
+        await ctx.send("No discipline tasks are currently tracked.", delete_after=60)
+        return
+
+    today = pd.to_datetime(datetime.datetime.now().date()).normalize()
+    if week_start in (None, ""):
+        start_date = today - pd.Timedelta(days=int(today.weekday()))
+    else:
+        try:
+            parsed_start = pd.to_datetime(week_start).normalize()
+            start_date = parsed_start - pd.Timedelta(days=int(parsed_start.weekday()))
+        except Exception:
+            await ctx.send("Invalid week_start format. Use YYYYMMDD (e.g., 20260511).", delete_after=60)
+            return
+
+    end_date = start_date + pd.Timedelta(days=6)
+
+    completion_df = load_discipline_completion_df()
+    rollup_df = build_discipline_category_rollup_df(discipline_df, completion_df, start_date, end_date)
+
+    if rollup_df.empty:
+        await ctx.send("No active discipline tasks to roll up.", delete_after=60)
+        return
+
+    total_target = int(rollup_df["TARGET_SUM"].sum())
+    total_actual = int(rollup_df["ACTUAL_SUM"].sum())
+    overall_pct = round(min(total_actual / total_target, 1) * 100, 1) if total_target > 0 else 0.0
+    cat_count = len(rollup_df)
+    strong = int((rollup_df["ADHERENCE_PERCENT"] >= 80).sum())
+    slipping = int(((rollup_df["ADHERENCE_PERCENT"] >= 50) & (rollup_df["ADHERENCE_PERCENT"] < 80)).sum())
+    off_track = int((rollup_df["ADHERENCE_PERCENT"] < 50).sum())
+
+    subtitle = (
+        f"Week {start_date.strftime('%m/%d')} - {end_date.strftime('%m/%d')} | "
+        f"Categories: {cat_count} | Strong: {strong} | Slipping: {slipping} | Off: {off_track} | "
+        f"Overall: {total_actual}/{total_target} ({overall_pct}%)"
+    )
+    chart = render_discipline_category_rollup_chart(
+        rollup_df=rollup_df,
+        chart_title="Discipline Category Adherence (Weekly)",
+        subtitle=subtitle,
+    )
+
+    await discipline_channel.send(f"<@{user_id}>, Weekly discipline category rollup:", delete_after=300)
+    await discipline_channel.send(
+        file=discord.File(fp=chart, filename="discipline_category_rollup.png"),
+        delete_after=300,
+    )
+
+    if ctx.channel.id != discipline_channel.id:
+        await ctx.send("Posted the category rollup in the discipline channel.", delete_after=300)
+
+
+@bot.command(
+    name="discipline_heatmap",
+    aliases=["heatmap", "discipline_activity"],
+    help="Post a GitHub-style heatmap of daily discipline completions over the last N days (default 90).",
+)
+async def discipline_heatmap(ctx, days: int = 90, reference_date=None):
+    ensure_discipline_dataframe_exists()
+    ensure_discipline_history_exists()
+
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+
+    discipline_channel = get_discipline_channel()
+    if not discipline_channel:
+        await ctx.send("Discipline channel not found. Please verify Channel_ID_discipline in config.", delete_after=60)
+        return
+
+    try:
+        days = int(days)
+    except Exception:
+        await ctx.send("Invalid `days` value. Provide a positive integer (e.g., 90).", delete_after=60)
+        return
+    if days < 7:
+        days = 7
+    if days > 365:
+        days = 365
+
+    if reference_date in (None, ""):
+        ref_day = pd.to_datetime(datetime.datetime.now().date()).normalize()
+    else:
+        try:
+            ref_day = pd.to_datetime(reference_date).normalize()
+        except Exception:
+            await ctx.send("Invalid reference_date. Use YYYYMMDD (e.g., 20260511).", delete_after=60)
+            return
+
+    completion_df = load_discipline_completion_df()
+    window_start = ref_day - pd.Timedelta(days=days - 1)
+
+    if completion_df is None or completion_df.empty:
+        active_days = 0
+        total_completions = 0
+        best_day_count = 0
+    else:
+        norm = completion_df.copy()
+        norm["COMPLETED_DATE"] = pd.to_datetime(norm["COMPLETED_DATE"], errors="coerce").dt.normalize()
+        norm = norm.dropna(subset=["COMPLETED_DATE"])
+        in_range = norm[(norm["COMPLETED_DATE"] >= window_start) & (norm["COMPLETED_DATE"] <= ref_day)]
+        if in_range.empty:
+            active_days = 0
+            total_completions = 0
+            best_day_count = 0
+        else:
+            per_day = in_range.groupby("COMPLETED_DATE")["TASK"].nunique()
+            active_days = int((per_day > 0).sum())
+            total_completions = int(per_day.sum())
+            best_day_count = int(per_day.max())
+
+    active_pct = round((active_days / days) * 100, 1) if days > 0 else 0.0
+    subtitle = (
+        f"{window_start.strftime('%m/%d/%Y')} → {ref_day.strftime('%m/%d/%Y')} • "
+        f"{days} days • Active days: {active_days} ({active_pct}%) • "
+        f"Completions: {total_completions} • Best day: {best_day_count}"
+    )
+
+    chart = render_discipline_heatmap_chart(
+        completion_df=completion_df,
+        reference_date=ref_day,
+        days=days,
+        chart_title="Discipline Activity Heatmap",
+        subtitle=subtitle,
+    )
+
+    await discipline_channel.send(
+        f"<@{user_id}>, Discipline activity heatmap (last {days} days):",
+        delete_after=300,
+    )
+    await discipline_channel.send(
+        file=discord.File(fp=chart, filename="discipline_heatmap.png"),
+        delete_after=300,
+    )
+
+    if ctx.channel.id != discipline_channel.id:
+        await ctx.send("Posted the discipline heatmap in the discipline channel.", delete_after=300)
 
 
 #%%

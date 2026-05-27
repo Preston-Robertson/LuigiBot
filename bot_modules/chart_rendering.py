@@ -297,3 +297,270 @@ def render_discipline_weekly_progress_chart(report_df, chart_title, subtitle=Non
     plt.close(fig)
     image_buffer.seek(0)
     return image_buffer
+
+
+def render_discipline_category_rollup_chart(rollup_df, chart_title, subtitle=None):
+    """Per-category adherence bars (0-100%, capped). Color: green ≥80, yellow 50-79, red <50.
+
+    Expects columns: CATAGORY, TASK_COUNT, TARGET_SUM, ACTUAL_SUM, ADHERENCE_PERCENT.
+    """
+    if rollup_df is None or rollup_df.empty:
+        rollup_df = rollup_df if rollup_df is not None else None
+
+    categories = rollup_df["CATAGORY"].astype(str).tolist() if rollup_df is not None and not rollup_df.empty else []
+    percents = rollup_df["ADHERENCE_PERCENT"].astype(float).tolist() if categories else []
+    actuals = rollup_df["ACTUAL_SUM"].astype(int).tolist() if categories else []
+    targets = rollup_df["TARGET_SUM"].astype(int).tolist() if categories else []
+    task_counts = rollup_df["TASK_COUNT"].astype(int).tolist() if categories else []
+
+    labels = style_axis_labels(categories, wrap_width=14, max_chars=28) if categories else []
+
+    fig, ax = plt.subplots(figsize=(max(10, len(labels) * 1.1), 5.6), dpi=150)
+    fig.patch.set_facecolor(VISUAL_THEME["bg"])
+    apply_chart_theme(ax)
+
+    ax.set_xlim(-0.7, max(len(labels), 1) - 0.3)
+    ax.set_ylim(0, 118)
+    ax.axhline(100, color=VISUAL_THEME["cyan"], linewidth=0.9, alpha=0.35, zorder=1)
+    ax.axhline(80, color=VISUAL_THEME["luigi"], linewidth=0.6, alpha=0.18, zorder=1, linestyle="--")
+    ax.axhline(50, color=VISUAL_THEME["warn"], linewidth=0.6, alpha=0.18, zorder=1, linestyle="--")
+
+    for i, pct in enumerate(percents):
+        if pct >= 80:
+            color = VISUAL_THEME["luigi"]
+        elif pct >= 50:
+            color = VISUAL_THEME["warn"]
+        else:
+            color = VISUAL_THEME["danger"]
+        draw_clean_bars(ax, [i], [pct], color, width=0.62)
+
+    style_chart_title(ax, chart_title)
+    if subtitle:
+        ax.text(
+            0.015, 0.99, subtitle, ha="left", va="top", transform=ax.transAxes,
+            fontsize=9, color=VISUAL_THEME["muted"], fontfamily=VISUAL_FONT_STACK,
+        )
+
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels, rotation=15, ha="right", fontsize=9, color=VISUAL_THEME["text"], fontfamily=VISUAL_FONT_STACK)
+    ax.set_yticks([0, 25, 50, 80, 100])
+    ax.set_yticklabels(["0%", "25%", "50%", "80%", "100%"], fontsize=9, color=VISUAL_THEME["muted"], fontfamily=VISUAL_FONT_STACK)
+    ax.set_ylabel("Weekly Adherence", fontsize=10, color=VISUAL_THEME["text"], fontfamily=VISUAL_FONT_STACK)
+
+    for i, pct in enumerate(percents):
+        actual = actuals[i]
+        target = targets[i]
+        tcount = task_counts[i]
+        overflow = actual - target
+        overflow_tag = f"  (+{overflow} over)" if overflow > 0 else ""
+        ax.text(
+            i, pct + 3, f"{pct}%", ha="center", va="bottom",
+            fontsize=9, color=VISUAL_THEME["text"], fontfamily=VISUAL_FONT_STACK, fontweight="bold",
+        )
+        ax.text(
+            i, -8, f"{actual}/{target}  •  {tcount} task{'s' if tcount != 1 else ''}{overflow_tag}",
+            ha="center", va="top",
+            fontsize=8, color=VISUAL_THEME["muted"], fontfamily=VISUAL_FONT_STACK,
+        )
+
+    legend_handles = [
+        plt.Rectangle((0, 0), 1, 1, color=VISUAL_THEME["luigi"], label="≥80% (Strong)"),
+        plt.Rectangle((0, 0), 1, 1, color=VISUAL_THEME["warn"], label="50–79% (Slipping)"),
+        plt.Rectangle((0, 0), 1, 1, color=VISUAL_THEME["danger"], label="<50% (Off Track)"),
+    ]
+    ax.legend(
+        handles=legend_handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.18),
+        ncol=3,
+        fontsize=9,
+        facecolor=VISUAL_THEME["panel"],
+        edgecolor=VISUAL_THEME["grid"],
+        labelcolor=VISUAL_THEME["text"],
+        framealpha=0.95,
+        borderpad=0.7,
+    )
+
+    fig.subplots_adjust(top=0.84, bottom=0.30)
+    fig.tight_layout(pad=1.2)
+    image_buffer = BytesIO()
+    fig.savefig(image_buffer, format="png", bbox_inches="tight")
+    plt.close(fig)
+    image_buffer.seek(0)
+    return image_buffer
+
+
+def render_discipline_heatmap_chart(
+    completion_df,
+    reference_date,
+    days=90,
+    chart_title="Discipline Activity Heatmap",
+    subtitle=None,
+):
+    """GitHub-style heatmap of daily discipline completions over the trailing `days` window.
+
+    Rows = day of week (Mon top, Sun bottom). Columns = weeks (oldest left → newest right).
+    Cell color intensity = unique discipline tasks completed that day.
+
+    `completion_df` is the long-format log (columns TASK, CATAGORY, COMPLETED_DATE, LOGGED_AT).
+    `reference_date` is the last day shown (inclusive).
+    """
+    import pandas as pd  # local import to avoid module-level dep churn
+    import numpy as np
+    from matplotlib.colors import ListedColormap, BoundaryNorm
+
+    reference_date = pd.to_datetime(reference_date).normalize()
+    days = int(max(7, days))
+
+    # Build day index spanning the window, padded so the first column starts on Monday.
+    window_start = reference_date - pd.Timedelta(days=days - 1)
+    pad_start = window_start - pd.Timedelta(days=int(window_start.weekday()))
+    pad_end = reference_date + pd.Timedelta(days=(6 - int(reference_date.weekday())))
+    all_days = pd.date_range(pad_start, pad_end, freq="D")
+    num_weeks = len(all_days) // 7
+
+    # Daily count = number of unique disciplines completed that day.
+    daily_counts = {}
+    if completion_df is not None and not completion_df.empty:
+        norm = completion_df.copy()
+        norm["COMPLETED_DATE"] = pd.to_datetime(norm["COMPLETED_DATE"], errors="coerce").dt.normalize()
+        norm = norm.dropna(subset=["COMPLETED_DATE"])
+        in_range = norm[(norm["COMPLETED_DATE"] >= pad_start) & (norm["COMPLETED_DATE"] <= pad_end)]
+        if not in_range.empty:
+            daily_counts = in_range.groupby("COMPLETED_DATE")["TASK"].nunique().to_dict()
+
+    matrix = np.full((7, num_weeks), np.nan, dtype=float)
+    in_window_mask = np.zeros((7, num_weeks), dtype=bool)
+    for idx, day in enumerate(all_days):
+        col = idx // 7
+        row = int(day.weekday())
+        if window_start <= day <= reference_date:
+            in_window_mask[row, col] = True
+            matrix[row, col] = float(daily_counts.get(day, 0))
+
+    # Tier palette: 0 → panel, 1 → faint green, 2 → med, 3 → strong, 4+ → max.
+    palette = [
+        VISUAL_THEME["panel_alt"],
+        "#1F4D33",
+        "#2F7A4F",
+        "#3FA968",
+        VISUAL_THEME["luigi"],
+    ]
+    boundaries = [-0.5, 0.5, 1.5, 2.5, 3.5, 1000]
+    cmap = ListedColormap(palette)
+    norm_obj = BoundaryNorm(boundaries, cmap.N)
+
+    # Figure sizing: scale width with number of weeks.
+    fig_w = max(9.5, min(18.0, num_weeks * 0.40 + 2.0))
+    fig, ax = plt.subplots(figsize=(fig_w, 3.6), dpi=150)
+    fig.patch.set_facecolor(VISUAL_THEME["bg"])
+    ax.set_facecolor(VISUAL_THEME["bg"])
+
+    # Draw cells as rectangles for fine control over gaps and out-of-window dimming.
+    cell_size = 1.0
+    gap = 0.12
+    for r in range(7):
+        for c in range(num_weeks):
+            x = c * cell_size
+            y = (6 - r) * cell_size  # invert so Monday is on top
+            val = matrix[r, c]
+            if not in_window_mask[r, c]:
+                face = VISUAL_THEME["bg"]
+                edge = VISUAL_THEME["panel"]
+                alpha = 0.35
+            else:
+                count = int(val) if not np.isnan(val) else 0
+                if count <= 0:
+                    face = palette[0]
+                elif count == 1:
+                    face = palette[1]
+                elif count == 2:
+                    face = palette[2]
+                elif count == 3:
+                    face = palette[3]
+                else:
+                    face = palette[4]
+                edge = VISUAL_THEME["panel"]
+                alpha = 1.0
+            ax.add_patch(Rectangle(
+                (x + gap / 2, y + gap / 2),
+                cell_size - gap, cell_size - gap,
+                facecolor=face, edgecolor=edge, linewidth=0.6, alpha=alpha,
+            ))
+
+    ax.set_xlim(0, num_weeks * cell_size)
+    ax.set_ylim(0, 7 * cell_size)
+    ax.set_aspect("equal")
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+    # Day-of-week labels (Mon top → Sun bottom). Show Mon/Wed/Fri only for cleanliness.
+    dow_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    ax.set_yticks([6 - i + 0.5 for i in range(7)])
+    ax.set_yticklabels(
+        [lbl if lbl in ("Mon", "Wed", "Fri") else "" for lbl in dow_labels],
+        fontsize=8, color=VISUAL_THEME["muted"], fontfamily=VISUAL_FONT_STACK,
+    )
+    ax.tick_params(axis="y", length=0, pad=2)
+
+    # Month labels above columns (show when month changes between consecutive weeks).
+    month_ticks = []
+    month_labels = []
+    last_month = None
+    for c in range(num_weeks):
+        col_monday = all_days[c * 7]
+        if col_monday.month != last_month:
+            month_ticks.append(c + 0.5)
+            month_labels.append(col_monday.strftime("%b"))
+            last_month = col_monday.month
+    ax.set_xticks(month_ticks)
+    ax.set_xticklabels(month_labels, fontsize=8, color=VISUAL_THEME["muted"], fontfamily=VISUAL_FONT_STACK)
+    ax.tick_params(axis="x", length=0, pad=4)
+
+    # Title + subtitle stacked above the grid (axes-relative coords so bbox_inches="tight" keeps them).
+    ax.text(
+        0.5, 1.22, chart_title,
+        ha="center", va="bottom", transform=ax.transAxes,
+        fontsize=14, fontweight="bold",
+        color=VISUAL_THEME["text"], fontfamily=VISUAL_FONT_STACK,
+    )
+    if subtitle:
+        ax.text(
+            0.5, 1.10, subtitle,
+            ha="center", va="bottom", transform=ax.transAxes,
+            fontsize=9, color=VISUAL_THEME["muted"], fontfamily=VISUAL_FONT_STACK,
+        )
+
+    # Legend (Less → More)
+    legend_y = -0.20
+    legend_x_start = 0.30
+    legend_box = 0.025
+    fig.text(legend_x_start - 0.04, legend_y + 0.012, "Less",
+             ha="right", va="center", fontsize=8,
+             color=VISUAL_THEME["muted"], fontfamily=VISUAL_FONT_STACK,
+             transform=ax.transAxes)
+    for i, color in enumerate(palette):
+        fig.patches.append(Rectangle(
+            (0, 0), 0, 0, facecolor=color,
+        ))
+        ax.add_patch(Rectangle(
+            (legend_x_start + i * (legend_box + 0.008), legend_y),
+            legend_box, 0.05,
+            transform=ax.transAxes, clip_on=False,
+            facecolor=color, edgecolor=VISUAL_THEME["panel"], linewidth=0.5,
+        ))
+    fig.text(
+        legend_x_start + len(palette) * (legend_box + 0.008) + 0.01,
+        legend_y + 0.012,
+        "More",
+        ha="left", va="center", fontsize=8,
+        color=VISUAL_THEME["muted"], fontfamily=VISUAL_FONT_STACK,
+        transform=ax.transAxes,
+    )
+
+    fig.subplots_adjust(top=0.80, bottom=0.22, left=0.06, right=0.98)
+    image_buffer = BytesIO()
+    fig.savefig(image_buffer, format="png", bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    image_buffer.seek(0)
+    return image_buffer
