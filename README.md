@@ -200,7 +200,7 @@ When you run the to-do list command, LuigiBot shows numbered task buttons. Selec
 - 8:00 AM: Daily active to-do summary
 - 11:00 PM: Tasks completed today summary + completed-task visual
 - 11:15 PM: Discipline nightly reminder with numbered completion buttons
-- 11:30 PM: 15-minute post check-in visuals (to-do completion snapshot + discipline goal-status snapshot)
+- 11:30 PM: 15-minute post check-in discipline goal-status snapshot
 - 5:00 PM Thursday: Midweek at-risk discipline nudge (configurable via `Discipline_At_Risk_*` keys)
 
 ## Discipline Data Model

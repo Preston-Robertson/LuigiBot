@@ -80,7 +80,6 @@ bot = commands.Bot(command_prefix=command_prefix, intents=discord.Intents.all())
 
 last_discipline_daily_date = None
 last_discipline_visual_date = None
-last_todo_visual_date = None
 last_todo_weekly_visual_date = None
 last_discipline_at_risk_date = None
 
@@ -229,7 +228,6 @@ async def to_do_list(ctx):
 async def send_daily_message():
     global last_discipline_daily_date
     global last_discipline_visual_date
-    global last_todo_visual_date
     global last_todo_weekly_visual_date
     global last_discipline_at_risk_date
 
@@ -377,32 +375,6 @@ async def send_daily_message():
     visual_trigger_hour, visual_trigger_minute = divmod(visual_trigger_total_minutes, 60)
 
     if now.hour == visual_trigger_hour and now.minute == visual_trigger_minute:
-        if last_todo_visual_date != now.date():
-            to_do_list_channel = get_todo_channel()
-            if to_do_list_channel:
-                try:
-                    to_do_list_df = pd.read_pickle(path_for_to_do_list)
-                    completion_series = build_completed_task_series(to_do_list_df, end_date=now.date(), days=7)
-
-                    today_total = int(completion_series.iloc[-1]) if not completion_series.empty else 0
-                    week_total = int(completion_series.sum())
-                    avg_daily = round(float(completion_series.mean()), 1) if len(completion_series) > 0 else 0
-
-                    daily_subtitle = f"Today: {today_total} | Last 7 days: {week_total} | Avg/day: {avg_daily}"
-                    daily_chart = render_completed_task_bar_chart(
-                        completion_series=completion_series,
-                        chart_title="To-Do Completion Trend (7 Days)",
-                        subtitle=daily_subtitle,
-                        highlight_index=len(completion_series) - 1,
-                    )
-
-                    await to_do_list_channel.send(f"<@{user_id}>, 15-minute post check-in completion snapshot:")
-                    await to_do_list_channel.send(file=discord.File(fp=daily_chart, filename="todo_completion_7_day.png"))
-                except Exception as e:
-                    print(f"Error sending to-do completion trend chart: {e}")
-
-            last_todo_visual_date = now.date()
-
         if last_discipline_visual_date != now.date():
             discipline_channel = get_discipline_channel()
             if discipline_channel:
