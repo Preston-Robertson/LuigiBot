@@ -134,42 +134,56 @@ async def on_ready():
             color=0x1E90FF,
         )
 
-        embed.add_field(
-            name="📋 To-Do List Commands",
-            value=(
-                "`/hello` — Greeting test command\n"
-                f"`/to_do_list` or `{command_prefix}to_do_list` — View active to-do items (sorted by priority & due date)\n"
-                f"`/create_task` or `{command_prefix}create_task` — Create a new to-do task with metadata (priority, due date, estimated time, etc.)\n"
-                f"`{command_prefix}edit_task <id> field=value ...` — Edit fields on an open task (priority, due_date, task_name, category, group, subgroup, link, status, estimated_time)\n"
-                f"`{command_prefix}delete_task <id>` — Delete an open task by id (history preserved)\n"
-                f"`{command_prefix}tasks field:value ...` — Search/filter open tasks (e.g. `category:Health priority:>=7 due:week`)\n"
-                f"`{command_prefix}to_do_completion_visual` — Post a 7-day completed-task bar chart to the to-do channel\n"
-                f"`{command_prefix}to_do_weekly_visual [week_end]` — Post an end-of-week bar chart to the to-do channel (optional YYYYMMDD)\n"
-                f"`/add_follow_up` or `{command_prefix}add_follow_up <trigger> <follow_up> [catagory] [priority] [due_offset_days] [estimated_time] [link]` — Auto-create a follow-up task when a trigger task is completed (e.g. Do Dishes → Put up Dishes)\n"
-                f"`{command_prefix}follow_ups` — List configured trigger → follow-up mappings\n"
-                f"`{command_prefix}delete_follow_up <id>` — Delete a follow-up mapping by id\n"
-            ),
-            inline=False,
-        )
+        todo_lines = [
+            "`/hello` — Greeting test command",
+            f"`/to_do_list` or `{command_prefix}to_do_list` — View active to-do items (sorted by priority & due date)",
+            f"`/create_task` or `{command_prefix}create_task` — Create a new to-do task with metadata (priority, due date, estimated time, etc.)",
+            f"`{command_prefix}edit_task <id> field=value ...` — Edit fields on an open task (priority, due_date, task_name, category, group, subgroup, link, status, estimated_time)",
+            f"`{command_prefix}delete_task <id>` — Delete an open task by id (history preserved)",
+            f"`{command_prefix}tasks field:value ...` — Search/filter open tasks (e.g. `category:Health priority:>=7 due:week`)",
+            f"`{command_prefix}to_do_completion_visual` — Post a 7-day completed-task bar chart to the to-do channel",
+            f"`{command_prefix}to_do_weekly_visual [week_end]` — Post an end-of-week bar chart to the to-do channel (optional YYYYMMDD)",
+            f"`/add_follow_up` or `{command_prefix}add_follow_up <trigger> <follow_up> [catagory] [priority] [due_offset_days] [estimated_time] [link]` — Auto-create a follow-up task when a trigger task is completed (e.g. Do Dishes → Put up Dishes)",
+            f"`{command_prefix}follow_ups` — List configured trigger → follow-up mappings",
+            f"`{command_prefix}delete_follow_up <id>` — Delete a follow-up mapping by id",
+        ]
 
-        embed.add_field(
-            name="🎯 Discipline Tracker Commands",
-            value=(
-                f"`/create_discipline_task` or `{command_prefix}create_discipline_task` — Add a discipline item (task name, category, frequency/week 1-7)\n"
-                f"`{command_prefix}discipline_list` — View all tracked discipline items\n"
-                f"`{command_prefix}log_discipline_completion` — Log completion of a discipline task (for data collection)\n"
-                f"`{command_prefix}today_completions` — View today's logged discipline completions (or any date)\n"
-                f"`{command_prefix}weekly_discipline_summary` — Weekly progress report vs frequency targets\n"
-                f"`{command_prefix}discipline_streaks` — Current streaks, best streaks, and 4-week consistency scores\n"
-                f"`{command_prefix}discipline_progress [YYYYMMDD]` — Weekly partial-credit progress bars (X/Y) for each discipline\n"
-                f"`{command_prefix}at_risk [YYYYMMDD]` — List disciplines that won't hit their weekly target at current pace (auto-pings midweek)\n"
-                f"`{command_prefix}discipline_heatmap [days] [YYYYMMDD]` — Post a GitHub-style heatmap of daily discipline completions (default 90 days)\n"
-                f"`{command_prefix}daily_discipline_visual` — Post today's discipline goal-status visual to the discipline channel\n"
-                f"`{command_prefix}weekly_discipline_visual [week_start]` — Post weekly discipline progress visual to the discipline channel\n"
-                f"`{command_prefix}discipline_category_rollup [week_start]` — Post weekly category-level adherence chart to the discipline channel\n"
-            ),
-            inline=False,
-        )
+        discipline_lines = [
+            f"`/create_discipline_task` or `{command_prefix}create_discipline_task` — Add a discipline item (task name, category, frequency/week 1-7)",
+            f"`{command_prefix}discipline_list` — View all tracked discipline items",
+            f"`{command_prefix}log_discipline_completion` — Log completion of a discipline task (for data collection)",
+            f"`{command_prefix}today_completions` — View today's logged discipline completions (or any date)",
+            f"`{command_prefix}weekly_discipline_summary` — Weekly progress report vs frequency targets",
+            f"`{command_prefix}discipline_streaks` — Current streaks, best streaks, and 4-week consistency scores",
+            f"`{command_prefix}discipline_progress [YYYYMMDD]` — Weekly partial-credit progress bars (X/Y) for each discipline",
+            f"`{command_prefix}at_risk [YYYYMMDD]` — List disciplines that won't hit their weekly target at current pace (auto-pings midweek)",
+            f"`{command_prefix}discipline_heatmap [days] [YYYYMMDD]` — Post a GitHub-style heatmap of daily discipline completions (default 90 days)",
+            f"`{command_prefix}daily_discipline_visual` — Post today's discipline goal-status visual to the discipline channel",
+            f"`{command_prefix}weekly_discipline_visual [week_start]` — Post weekly discipline progress visual to the discipline channel",
+            f"`{command_prefix}discipline_category_rollup [week_start]` — Post weekly category-level adherence chart to the discipline channel",
+        ]
+
+        def _chunk_lines_for_embed(lines, limit=1024):
+            chunks = []
+            current = ""
+            for line in lines:
+                addition = (line if not current else "\n" + line)
+                if len(current) + len(addition) > limit:
+                    chunks.append(current)
+                    current = line
+                else:
+                    current += addition
+            if current:
+                chunks.append(current)
+            return chunks
+
+        for idx, chunk in enumerate(_chunk_lines_for_embed(todo_lines)):
+            name = "📋 To-Do List Commands" if idx == 0 else "📋 To-Do List Commands (cont.)"
+            embed.add_field(name=name, value=chunk, inline=False)
+
+        for idx, chunk in enumerate(_chunk_lines_for_embed(discipline_lines)):
+            name = "🎯 Discipline Tracker Commands" if idx == 0 else "🎯 Discipline Tracker Commands (cont.)"
+            embed.add_field(name=name, value=chunk, inline=False)
 
         embed.set_footer(text=f"Use slash commands or '{command_prefix}' prefix commands as listed above. Nightly reminders have interactive buttons!")
 
