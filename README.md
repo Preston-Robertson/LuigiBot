@@ -22,11 +22,11 @@ A personal Discord bot for managing a to-do list and a separate discipline track
 ```text
 LuigiBot/
 |-- main.py                       # Bot instance, commands, scheduler, event handlers
-|-- luigi.db                      # SQLite database (single source of truth for all bot data)
+|-- luigi.db                      # SQLite database (default backend; Postgres is opt-in)
 |-- bot_modules/                  # Helper package
 |   |-- __init__.py
-|   |-- bot_config.py             # Shared config (paths, channel IDs, prefix, database_path)
-|   |-- db.py                     # SQLite persistence layer (all reads/writes go through here)
+|   |-- bot_config.py             # Shared config (paths, channel IDs, prefix, DB backend + connection)
+|   |-- db.py                     # Persistence layer (SQLAlchemy Core; SQLite or Postgres)
 |   |-- chart_rendering.py        # Visual theme + all chart rendering functions
 |   |-- discipline_helpers.py     # Discipline data processing, streaks, embeds
 |   |-- follow_up_helpers.py      # Follow-up task creation helpers
@@ -78,6 +78,32 @@ pip install -r requirements.txt
 
 `Database_Path` is optional and defaults to `<repo>/luigi.db`. The `LUIGI_DB_PATH`
 environment variable, if set, overrides the config value.
+
+### Optional: Postgres backend
+
+LuigiBot can run against a shared Postgres server instead of the local SQLite
+file. SQLite remains the default; Postgres is opt-in.
+
+Precedence for every field: **env var > `config.json` > code default**.
+
+| Purpose               | Env var                | `config.json` key | Notes                                  |
+|-----------------------|------------------------|-------------------|----------------------------------------|
+| Backend selector      | `LUIGI_DB_BACKEND`     | `DB_Backend`      | `sqlite` (default) or `postgres`       |
+| Full SA URL (optional)| `LUIGI_DATABASE_URL`   | `Database_URL`    | e.g. `postgresql+psycopg://user@host/db` |
+| Host                  | `LUIGI_PG_HOST`        | `PG_Host`         | default `127.0.0.1`                    |
+| Port                  | `LUIGI_PG_PORT`        | `PG_Port`         | default `5432`                         |
+| Database              | `LUIGI_PG_DB`          | `PG_Database`     | default `luigi_todo`                   |
+| User                  | `LUIGI_PG_USER`        | `PG_User`         | default `luigi_app`                    |
+| Password              | `LUIGI_PG_PASSWORD`    | *(not read)*      | **env-only by design**                 |
+
+The password is intentionally **not** read from `config.json` — that file already
+holds the Discord bot token and should not accumulate more secrets. Set
+`LUIGI_PG_PASSWORD` in the process environment (or use `LUIGI_DATABASE_URL` with
+the password embedded, if your deployment prefers a single URL secret).
+
+Postgres runs against a fresh empty DB created by `init_db()`. Copying existing
+SQLite data into Postgres is a separate operational step (throwaway script or
+`pgloader`); it is not part of the bot code.
 
 3. Run the bot. The database file and its schema are created automatically on first run.
 
@@ -199,22 +225,27 @@ When you run the to-do list command, LuigiBot shows numbered task buttons. Selec
 
 ## Data Storage
 
-All bot state lives in a single SQLite database at `luigi.db` (project root by default).
+All bot state lives in a single database. By default this is `luigi.db` (SQLite) at the
+project root; setting `LUIGI_DB_BACKEND=postgres` points the same code at a shared
+Postgres server instead (see [Optional: Postgres backend](#optional-postgres-backend)).
 Every module reads and writes through `bot_modules/db.py` — nothing else touches the
-file directly. This makes it safe for a future web UI (e.g. FastAPI) to open the same
-database in read-only mode without stepping on the running bot.
+database directly. This makes it safe for a future web UI (e.g. FastAPI) to open the
+same database concurrently without stepping on the running bot.
 
 ### Runtime characteristics
 
-- **WAL mode** with `synchronous=NORMAL` and `busy_timeout=30000` — concurrent readers
-  (bot + external tools) do not block each other.
-- **Foreign keys enabled** and one connection per operation. Discord.py's asyncio
-  callbacks all get a fresh, short-lived connection, so there is no cross-thread
-  cursor sharing.
-- **Whole-DataFrame save pattern**: `db.save_tasks_df(df)` etc. run a transactional
-  `DELETE` + `executemany INSERT`. This is fine at current row counts (tens to low
-  hundreds) and lets the existing "load whole df, mutate, save whole df" call sites
-  work unchanged.
+- **SQLite:** WAL mode with `synchronous=NORMAL`, `foreign_keys=ON`, and
+  `busy_timeout=30000`. PRAGMAs are applied on every new connection via a
+  SQLAlchemy `connect` event listener. Concurrent readers (bot + external tools)
+  do not block each other.
+- **Postgres:** MVCC handles concurrency server-side; no PRAGMAs apply.
+  The engine is created with `pool_pre_ping=True` so stale connections on a
+  long-lived bot process are transparently retried.
+- **Whole-DataFrame save pattern**: `db.save_tasks_df(df)` etc. run a
+  transactional `DELETE` + bulk `INSERT` inside `_ENGINE.begin()`. Under
+  Postgres MVCC this is safe for concurrent readers (they see the pre-txn
+  snapshot until COMMIT). Surrogate `id` values are not stable across saves
+  on either engine — a documented consequence of the whole-table replace.
 
 ### Column naming
 
@@ -313,10 +344,14 @@ migration is how future schema changes will be gated.
 
 ### Backups
 
-SQLite makes backups trivial — while the bot is stopped, copy `luigi.db` (and the
-`.db-wal` / `.db-shm` files if present) to any location. To back up while the bot
-is running, use `sqlite3 luigi.db ".backup 'backup.db'"` — the online backup API
-is safe against the WAL.
+**SQLite:** while the bot is stopped, copy `luigi.db` (and the `.db-wal` /
+`.db-shm` files if present) to any location. To back up while the bot is running,
+use `sqlite3 luigi.db ".backup 'backup.db'"` — the online backup API is safe
+against the WAL.
+
+**Postgres:** use standard Postgres tooling (`pg_dump`, base backups, or your
+managed provider's snapshot feature). The bot writes nothing that requires
+custom backup handling.
 
 ## Notes
 

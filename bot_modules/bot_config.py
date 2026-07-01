@@ -47,6 +47,25 @@ database_path = os.environ.get(
     _normalize_path(config.get("Database_Path"), "luigi.db"),
 )
 
+# --- Database backend selection ---------------------------------------------
+# "sqlite" (default) keeps existing behavior. Set to "postgres" to point db.py
+# at a shared Postgres server. Precedence per field: env var > config.json > default.
+db_backend = os.environ.get(
+    "LUIGI_DB_BACKEND", config.get("DB_Backend", "sqlite")
+).strip().lower()
+
+# Full SQLAlchemy URL wins if provided (env or config). Otherwise db.py
+# assembles one from the discrete PG_* fields below.
+database_url = os.environ.get("LUIGI_DATABASE_URL", config.get("Database_URL"))
+
+pg_host = os.environ.get("LUIGI_PG_HOST", config.get("PG_Host", "127.0.0.1"))
+pg_port = int(os.environ.get("LUIGI_PG_PORT", config.get("PG_Port", 5432)))
+pg_database = os.environ.get("LUIGI_PG_DB", config.get("PG_Database", "luigi_todo"))
+pg_user = os.environ.get("LUIGI_PG_USER", config.get("PG_User", "luigi_app"))
+# Password is env-only by design. Do NOT read it from config.json — that file
+# already holds the Discord bot token and should not accumulate more secrets.
+pg_password = os.environ.get("LUIGI_PG_PASSWORD", "")
+
 discipline_delete_after_seconds = int(config.get("Discipline_Delete_After_Seconds", 7200))
 discipline_daily_hour = int(config.get("Discipline_Daily_Hour", 23))
 discipline_daily_minute = int(config.get("Discipline_Daily_Minute", 15))

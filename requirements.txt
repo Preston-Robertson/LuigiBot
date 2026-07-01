@@ -4,5 +4,9 @@ pandas>=2.0
 pytz>=2024.1
 matplotlib>=3.8
 
+# Persistence engine (SQLite always, Postgres opt-in via LUIGI_DB_BACKEND)
+SQLAlchemy>=2.0
+psycopg[binary]>=3.1
+
 # Optional: notebook tools used in to_do_list/*.ipynb playgrounds
 ipykernel>=6.0

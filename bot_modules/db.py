@@ -1,33 +1,49 @@
-"""SQLite persistence layer for LuigiBot.
+"""Persistence layer for LuigiBot (SQLite default, Postgres opt-in).
 
 Single source of truth for all bot data. Every other module reads/writes
-via the helpers here; nothing else should touch sqlite3 or the .pkl files.
+via the helpers here; nothing else should touch sqlite3, psycopg, or the
+.pkl files.
 
 Design notes
 ------------
-- WAL mode + busy_timeout so future readers (web UI) don't collide with the bot.
-- Whole-DataFrame load/save helpers mirror the old `pd.read_pickle` /
-  `pd.to_pickle` call sites so the bot refactor is a near-mechanical rename.
+- Runs on either SQLite (default) or Postgres via SQLAlchemy Core. Backend
+  is selected once at import from `bot_config.db_backend` ("sqlite" |
+  "postgres"). Public API is identical on both engines.
 - Column names on the DataFrame side are preserved *exactly* as the bot
   already uses them (including the `CATAGORY` spelling and the `GROUP` /
   `SUB-GROUP` / `RELEVANT LINK` spacing). SQL columns are snake_case
   because `GROUP` is a reserved word.
-- Dates/timestamps are stored as ISO-8601 TEXT and parsed back on read.
+- Dates/timestamps are stored as ISO-8601 TEXT and parsed back on read
+  (same on both engines — deliberate, to keep the codepath uniform).
+- Booleans are stored as INTEGER 0/1 on both engines (psycopg3 rejects
+  int -> bool coercion, so native BOOLEAN would break the write path).
 - `discipline_history` is *not* a table — it's rebuilt from the long
-  `discipline_completions` table on demand, so downstream matrix code keeps
-  working unchanged.
+  `discipline_completions` table on demand.
+- The four list tables (`tasks`, `recurring_tasks`, `discipline_list`,
+  `follow_up_tasks`) use whole-DataFrame replace inside a single
+  transaction. On Postgres this is MVCC-safe: concurrent readers see
+  the pre-txn snapshot until COMMIT, never an empty table.
 """
 from __future__ import annotations
 
 import os
-import sqlite3
 import threading
-from contextlib import contextmanager
 from typing import Iterable, Optional
 
 import pandas as pd
+from sqlalchemy import URL, create_engine, event, text
+from sqlalchemy.engine import Engine
 
-from .bot_config import database_path
+from .bot_config import (
+    database_path,
+    database_url,
+    db_backend,
+    pg_database,
+    pg_host,
+    pg_password,
+    pg_port,
+    pg_user,
+)
 
 
 SCHEMA_VERSION = 1
@@ -36,143 +52,173 @@ _INIT_LOCK = threading.Lock()
 _INITIALIZED = False
 
 
-# --- Connection management ---------------------------------------------------
+# --- Engine construction -----------------------------------------------------
 
-@contextmanager
-def get_connection():
-    """Yield a sqlite3 connection with WAL + row_factory set up. Auto-commits.
+def _make_engine() -> Engine:
+    """Build the SQLAlchemy engine for the configured backend.
 
-    We open a fresh connection per call (cheap for SQLite) so this is safe to
-    use from discord.py's asyncio callbacks — no cross-thread cursor sharing.
+    SQLite path uses URL.create so Windows absolute paths (C:\\...) are
+    quoted safely. Postgres path prefers a full URL if the user supplied
+    one; otherwise it assembles psycopg3 driver URL from discrete parts.
     """
-    conn = sqlite3.connect(database_path, timeout=30, isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    # PRAGMAs are cheap and idempotent per connection.
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA busy_timeout=30000")
-    try:
-        yield conn
-    finally:
-        conn.close()
+    if db_backend == "postgres":
+        if database_url:
+            url = database_url
+        else:
+            url = URL.create(
+                "postgresql+psycopg",
+                username=pg_user,
+                password=pg_password or None,
+                host=pg_host,
+                port=pg_port,
+                database=pg_database,
+            )
+        # pool_pre_ping guards against stale connections on a long-lived bot.
+        return create_engine(url, pool_pre_ping=True, future=True)
+
+    # Default: SQLite
+    url = URL.create("sqlite", database=database_path)
+    engine = create_engine(url, future=True)
+
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragmas(dbapi_conn, _record):  # noqa: ANN001
+        cur = dbapi_conn.cursor()
+        cur.execute("PRAGMA journal_mode=WAL")
+        cur.execute("PRAGMA synchronous=NORMAL")
+        cur.execute("PRAGMA foreign_keys=ON")
+        cur.execute("PRAGMA busy_timeout=30000")
+        cur.close()
+
+    return engine
+
+
+_ENGINE: Engine = _make_engine()
+_IS_POSTGRES = db_backend == "postgres"
 
 
 # --- Schema ------------------------------------------------------------------
 
-_TASKS_SQL = """
-CREATE TABLE IF NOT EXISTS tasks (
-    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-    task               TEXT    NOT NULL,
-    priority           INTEGER DEFAULT 1,
-    status             TEXT    DEFAULT 'Not Started',
-    due_date           TEXT,
-    relevant_link      TEXT,
-    catagory           TEXT,
-    task_group         TEXT,
-    sub_group          TEXT,
-    task_creation      TEXT,
-    start_time         TEXT,
-    estimated_time     REAL,
-    logged_hours       REAL    DEFAULT 0,
-    completed          INTEGER DEFAULT 0,
-    completed_time     TEXT,
-    recurring          INTEGER DEFAULT 0,
-    recurring_interval INTEGER
-);
-CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
-CREATE INDEX IF NOT EXISTS idx_tasks_due    ON tasks(due_date);
-"""
+def _id_ddl() -> str:
+    """Dialect-specific auto-increment primary key column definition."""
+    if _IS_POSTGRES:
+        return "id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY"
+    return "id INTEGER PRIMARY KEY AUTOINCREMENT"
 
-_RECURRING_SQL = """
-CREATE TABLE IF NOT EXISTS recurring_tasks (
-    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-    task               TEXT    NOT NULL,
-    priority           INTEGER DEFAULT 1,
-    status             TEXT    DEFAULT 'Not Started',
-    due_date           TEXT,
-    relevant_link      TEXT,
-    catagory           TEXT,
-    task_group         TEXT,
-    sub_group          TEXT,
-    task_creation      TEXT,
-    start_time         TEXT,
-    estimated_time     REAL,
-    logged_hours       REAL    DEFAULT 0,
-    completed          INTEGER DEFAULT 0,
-    completed_time     TEXT,
-    recurring          INTEGER DEFAULT 1,
-    recurring_interval INTEGER
-);
-"""
 
-_DISCIPLINE_LIST_SQL = """
-CREATE TABLE IF NOT EXISTS discipline_list (
-    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-    task               TEXT    NOT NULL,
-    catagory           TEXT,
-    frequency_per_week INTEGER DEFAULT 1,
-    active             INTEGER DEFAULT 1,
-    current_streak     INTEGER DEFAULT 0
-);
-"""
-
-_DISCIPLINE_COMPLETIONS_SQL = """
-CREATE TABLE IF NOT EXISTS discipline_completions (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    task           TEXT NOT NULL,
-    catagory       TEXT,
-    completed_date TEXT NOT NULL,
-    logged_at      TEXT,
-    UNIQUE(task, completed_date)
-);
-CREATE INDEX IF NOT EXISTS idx_disc_comp_date ON discipline_completions(completed_date);
-CREATE INDEX IF NOT EXISTS idx_disc_comp_task ON discipline_completions(task);
-"""
-
-_FOLLOW_UPS_SQL = """
-CREATE TABLE IF NOT EXISTS follow_up_tasks (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    trigger_task    TEXT NOT NULL,
-    follow_up_task  TEXT NOT NULL,
-    catagory        TEXT,
-    task_group      TEXT,
-    subgroup        TEXT,
-    relevant_link   TEXT,
-    priority        INTEGER DEFAULT 1,
-    estimated_time  REAL,
-    due_offset_days INTEGER,
-    created         TEXT
-);
-"""
-
-_SCHEMA_VERSION_SQL = """
-CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
-"""
+def _ddl_statements() -> list[str]:
+    """All DDL as individual statements. SA connections execute one at a time
+    (unlike sqlite3.executescript), so keep these split."""
+    id_col = _id_ddl()
+    return [
+        f"""
+        CREATE TABLE IF NOT EXISTS tasks (
+            {id_col},
+            task               TEXT    NOT NULL,
+            priority           INTEGER DEFAULT 1,
+            status             TEXT    DEFAULT 'Not Started',
+            due_date           TEXT,
+            relevant_link      TEXT,
+            catagory           TEXT,
+            task_group         TEXT,
+            sub_group          TEXT,
+            task_creation      TEXT,
+            start_time         TEXT,
+            estimated_time     REAL,
+            logged_hours       REAL    DEFAULT 0,
+            completed          INTEGER DEFAULT 0,
+            completed_time     TEXT,
+            recurring          INTEGER DEFAULT 0,
+            recurring_interval INTEGER
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)",
+        "CREATE INDEX IF NOT EXISTS idx_tasks_due    ON tasks(due_date)",
+        f"""
+        CREATE TABLE IF NOT EXISTS recurring_tasks (
+            {id_col},
+            task               TEXT    NOT NULL,
+            priority           INTEGER DEFAULT 1,
+            status             TEXT    DEFAULT 'Not Started',
+            due_date           TEXT,
+            relevant_link      TEXT,
+            catagory           TEXT,
+            task_group         TEXT,
+            sub_group          TEXT,
+            task_creation      TEXT,
+            start_time         TEXT,
+            estimated_time     REAL,
+            logged_hours       REAL    DEFAULT 0,
+            completed          INTEGER DEFAULT 0,
+            completed_time     TEXT,
+            recurring          INTEGER DEFAULT 1,
+            recurring_interval INTEGER
+        )
+        """,
+        f"""
+        CREATE TABLE IF NOT EXISTS discipline_list (
+            {id_col},
+            task               TEXT    NOT NULL,
+            catagory           TEXT,
+            frequency_per_week INTEGER DEFAULT 1,
+            active             INTEGER DEFAULT 1,
+            current_streak     INTEGER DEFAULT 0
+        )
+        """,
+        f"""
+        CREATE TABLE IF NOT EXISTS discipline_completions (
+            {id_col},
+            task           TEXT NOT NULL,
+            catagory       TEXT,
+            completed_date TEXT NOT NULL,
+            logged_at      TEXT,
+            UNIQUE(task, completed_date)
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_disc_comp_date ON discipline_completions(completed_date)",
+        "CREATE INDEX IF NOT EXISTS idx_disc_comp_task ON discipline_completions(task)",
+        f"""
+        CREATE TABLE IF NOT EXISTS follow_up_tasks (
+            {id_col},
+            trigger_task    TEXT NOT NULL,
+            follow_up_task  TEXT NOT NULL,
+            catagory        TEXT,
+            task_group      TEXT,
+            subgroup        TEXT,
+            relevant_link   TEXT,
+            priority        INTEGER DEFAULT 1,
+            estimated_time  REAL,
+            due_offset_days INTEGER,
+            created         TEXT
+        )
+        """,
+        "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)",
+    ]
 
 
 def init_db() -> None:
-    """Create the DB file (and parent dirs) and all tables if missing. Idempotent."""
+    """Create the DB (and parent dirs for SQLite) and all tables if missing. Idempotent."""
     global _INITIALIZED
     if _INITIALIZED:
         return
     with _INIT_LOCK:
         if _INITIALIZED:
             return
-        os.makedirs(os.path.dirname(os.path.abspath(database_path)) or ".", exist_ok=True)
-        with get_connection() as conn:
-            for stmt in (
-                _TASKS_SQL,
-                _RECURRING_SQL,
-                _DISCIPLINE_LIST_SQL,
-                _DISCIPLINE_COMPLETIONS_SQL,
-                _FOLLOW_UPS_SQL,
-                _SCHEMA_VERSION_SQL,
-            ):
-                conn.executescript(stmt)
-            existing = conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
+        if not _IS_POSTGRES:
+            os.makedirs(
+                os.path.dirname(os.path.abspath(database_path)) or ".",
+                exist_ok=True,
+            )
+        with _ENGINE.begin() as conn:
+            for stmt in _ddl_statements():
+                conn.execute(text(stmt))
+            existing = conn.execute(
+                text("SELECT version FROM schema_version LIMIT 1")
+            ).first()
             if existing is None:
-                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
+                conn.execute(
+                    text("INSERT INTO schema_version (version) VALUES (:v)"),
+                    {"v": SCHEMA_VERSION},
+                )
         _INITIALIZED = True
 
 
@@ -275,10 +321,9 @@ COMPLETION_DF_COLUMNS = ["TASK", "CATAGORY", "COMPLETED_DATE", "LOGGED_AT"]
 # --- Serialization helpers ---------------------------------------------------
 
 def _iso_or_none(value):
-    """Serialize a scalar to ISO string / int / float / None for SQLite."""
+    """Serialize a scalar to ISO string / int / float / None for the DB."""
     if value is None:
         return None
-    # pandas NA / NaT / NaN
     try:
         if pd.isna(value):
             return None
@@ -332,24 +377,26 @@ def _to_float_or_none(value):
         return None
 
 
-def _tasks_row_to_sql_params(row: pd.Series, sql_columns: Iterable[str]) -> tuple:
-    """Convert a task-shaped Series -> tuple of SQL-safe values in `sql_columns` order."""
-    out = []
+def _tasks_row_to_sql_params(row: pd.Series, sql_columns: Iterable[str]) -> dict:
+    """Convert a task-shaped Series -> dict keyed by SQL column names."""
+    out: dict = {}
     for sql_col in sql_columns:
         df_col = _TASKS_SQL_TO_DF[sql_col]
         value = row.get(df_col)
         if df_col in _TASKS_BOOL_COLUMNS:
-            out.append(_to_bool_int(value))
+            out[sql_col] = _to_bool_int(value)
         elif df_col in _TASKS_INT_COLUMNS:
-            out.append(_to_int_or_none(value))
+            out[sql_col] = _to_int_or_none(value)
         elif df_col in _TASKS_FLOAT_COLUMNS:
-            out.append(_to_float_or_none(value))
+            out[sql_col] = _to_float_or_none(value)
         elif df_col in _TASKS_DATE_COLUMNS:
-            out.append(_iso_or_none(pd.to_datetime(value, errors="coerce") if value is not None else None))
+            out[sql_col] = _iso_or_none(
+                pd.to_datetime(value, errors="coerce") if value is not None else None
+            )
         else:
             v = _iso_or_none(value)
-            out.append(None if v is None else str(v))
-    return tuple(out)
+            out[sql_col] = None if v is None else str(v)
+    return out
 
 
 def _empty_task_df() -> pd.DataFrame:
@@ -375,8 +422,8 @@ _TASKS_SQL_COLS = list(_TASKS_SQL_TO_DF.keys())
 
 def _read_task_table(table_name: str) -> pd.DataFrame:
     init_db()
-    with get_connection() as conn:
-        df = pd.read_sql_query(f"SELECT * FROM {table_name}", conn)
+    with _ENGINE.connect() as conn:
+        df = pd.read_sql_query(text(f"SELECT * FROM {table_name}"), conn)
     if df.empty:
         return _empty_task_df()
     if "id" in df.columns:
@@ -395,7 +442,6 @@ def _read_task_table(table_name: str) -> pd.DataFrame:
     for col in _TASKS_FLOAT_COLUMNS:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-    # Return columns in the canonical DataFrame order the bot expects.
     for col in TASK_DF_COLUMNS:
         if col not in df.columns:
             df[col] = None
@@ -405,28 +451,20 @@ def _read_task_table(table_name: str) -> pd.DataFrame:
 def _write_task_table(table_name: str, df: pd.DataFrame) -> None:
     """Atomically replace the contents of `table_name` with `df`.
 
-    We take the whole-DataFrame approach (delete + bulk insert in one txn) so
-    all the existing read-modify-write pickle call sites keep working with a
-    trivial rename. Fine for these small tables.
+    Whole-DataFrame replace inside one transaction. On Postgres, MVCC keeps
+    concurrent readers on the pre-txn snapshot until COMMIT — no partial
+    reads. Surrogate `id`s are not stable across saves (same as SQLite).
     """
     init_db()
-    with get_connection() as conn:
-        conn.execute("BEGIN")
-        try:
-            conn.execute(f"DELETE FROM {table_name}")
-            if df is not None and not df.empty:
-                cols = _TASKS_SQL_COLS
-                placeholders = ",".join(["?"] * len(cols))
-                col_list = ",".join(cols)
-                params = [_tasks_row_to_sql_params(row, cols) for _, row in df.iterrows()]
-                conn.executemany(
-                    f"INSERT INTO {table_name} ({col_list}) VALUES ({placeholders})",
-                    params,
-                )
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
+    cols = _TASKS_SQL_COLS
+    col_list = ", ".join(cols)
+    placeholders = ", ".join(f":{c}" for c in cols)
+    insert_sql = text(f"INSERT INTO {table_name} ({col_list}) VALUES ({placeholders})")
+    with _ENGINE.begin() as conn:
+        conn.execute(text(f"DELETE FROM {table_name}"))
+        if df is not None and not df.empty:
+            params = [_tasks_row_to_sql_params(row, cols) for _, row in df.iterrows()]
+            conn.execute(insert_sql, params)
 
 
 def load_tasks_df() -> pd.DataFrame:
@@ -453,8 +491,8 @@ def save_recurring_df(df: pd.DataFrame) -> None:
 
 def load_discipline_df() -> pd.DataFrame:
     init_db()
-    with get_connection() as conn:
-        df = pd.read_sql_query("SELECT * FROM discipline_list", conn)
+    with _ENGINE.connect() as conn:
+        df = pd.read_sql_query(text("SELECT * FROM discipline_list"), conn)
     if df.empty:
         return _empty_discipline_df()
     if "id" in df.columns:
@@ -479,43 +517,57 @@ def load_discipline_df() -> pd.DataFrame:
 
 def save_discipline_df(df: pd.DataFrame) -> None:
     init_db()
-    with get_connection() as conn:
-        conn.execute("BEGIN")
-        try:
-            conn.execute("DELETE FROM discipline_list")
-            if df is not None and not df.empty:
-                params = []
-                for _, row in df.iterrows():
-                    params.append(
-                        (
-                            None if pd.isna(row.get("TASK")) else str(row.get("TASK")),
-                            None if pd.isna(row.get("CATAGORY")) else str(row.get("CATAGORY")),
-                            _to_int_or_none(row.get("FREQUENCY_PER_WEEK")) or 1,
-                            _to_bool_int(row.get("ACTIVE") if not pd.isna(row.get("ACTIVE")) else True),
-                            _to_int_or_none(row.get("CURRENT_STREAK")) or 0,
-                        )
-                    )
-                conn.executemany(
-                    "INSERT INTO discipline_list (task, catagory, frequency_per_week, active, current_streak) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    params,
+    insert_sql = text(
+        "INSERT INTO discipline_list "
+        "(task, catagory, frequency_per_week, active, current_streak) "
+        "VALUES (:task, :catagory, :frequency_per_week, :active, :current_streak)"
+    )
+    with _ENGINE.begin() as conn:
+        conn.execute(text("DELETE FROM discipline_list"))
+        if df is not None and not df.empty:
+            params = []
+            for _, row in df.iterrows():
+                params.append(
+                    {
+                        "task": None if pd.isna(row.get("TASK")) else str(row.get("TASK")),
+                        "catagory": None if pd.isna(row.get("CATAGORY")) else str(row.get("CATAGORY")),
+                        "frequency_per_week": _to_int_or_none(row.get("FREQUENCY_PER_WEEK")) or 1,
+                        "active": _to_bool_int(
+                            row.get("ACTIVE") if not pd.isna(row.get("ACTIVE")) else True
+                        ),
+                        "current_streak": _to_int_or_none(row.get("CURRENT_STREAK")) or 0,
+                    }
                 )
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
+            conn.execute(insert_sql, params)
 
 
 # --- Discipline completions & history matrix --------------------------------
 
 def _catagory_for_task(conn, task_name: str) -> Optional[str]:
     row = conn.execute(
-        "SELECT catagory FROM discipline_list WHERE lower(trim(task)) = lower(trim(?)) LIMIT 1",
-        (task_name,),
-    ).fetchone()
+        text(
+            "SELECT catagory FROM discipline_list "
+            "WHERE lower(trim(task)) = lower(trim(:t)) LIMIT 1"
+        ),
+        {"t": task_name},
+    ).first()
     if row is None:
         return None
-    return row["catagory"]
+    return row.catagory
+
+
+# Dialect-specific upsert for discipline_completions. Both variants are no-ops
+# on duplicate (task, completed_date), and both return rowcount=1 on insert,
+# 0 on skip.
+_APPEND_COMPLETION_SQL = text(
+    "INSERT INTO discipline_completions (task, catagory, completed_date, logged_at) "
+    "VALUES (:task, :catagory, :completed_date, :logged_at) "
+    "ON CONFLICT (task, completed_date) DO NOTHING"
+    if db_backend == "postgres"
+    else
+    "INSERT OR IGNORE INTO discipline_completions (task, catagory, completed_date, logged_at) "
+    "VALUES (:task, :catagory, :completed_date, :logged_at)"
+)
 
 
 def append_discipline_completion(task_name: str, completed_date, catagory: Optional[str] = None) -> bool:
@@ -524,15 +576,19 @@ def append_discipline_completion(task_name: str, completed_date, catagory: Optio
     completed_ts = pd.to_datetime(completed_date).normalize()
     date_str = completed_ts.date().isoformat()
     logged_at = pd.Timestamp.now().isoformat(sep=" ", timespec="seconds")
-    with get_connection() as conn:
+    with _ENGINE.begin() as conn:
         if catagory is None:
             catagory = _catagory_for_task(conn, task_name) or "Discipline"
-        cur = conn.execute(
-            "INSERT OR IGNORE INTO discipline_completions (task, catagory, completed_date, logged_at) "
-            "VALUES (?, ?, ?, ?)",
-            (str(task_name).strip(), catagory, date_str, logged_at),
+        result = conn.execute(
+            _APPEND_COMPLETION_SQL,
+            {
+                "task": str(task_name).strip(),
+                "catagory": catagory,
+                "completed_date": date_str,
+                "logged_at": logged_at,
+            },
         )
-        return cur.rowcount > 0
+        return result.rowcount > 0
 
 
 def delete_discipline_completion(task_name: str, completed_date) -> bool:
@@ -540,12 +596,15 @@ def delete_discipline_completion(task_name: str, completed_date) -> bool:
     init_db()
     completed_ts = pd.to_datetime(completed_date).normalize()
     date_str = completed_ts.date().isoformat()
-    with get_connection() as conn:
-        cur = conn.execute(
-            "DELETE FROM discipline_completions WHERE task = ? AND completed_date = ?",
-            (str(task_name).strip(), date_str),
+    with _ENGINE.begin() as conn:
+        result = conn.execute(
+            text(
+                "DELETE FROM discipline_completions "
+                "WHERE task = :task AND completed_date = :d"
+            ),
+            {"task": str(task_name).strip(), "d": date_str},
         )
-        return cur.rowcount > 0
+        return result.rowcount > 0
 
 
 def set_discipline_cell(task_name: str, date, value) -> pd.DataFrame:
@@ -575,22 +634,26 @@ def is_task_completed_on(task_name: str, date, history_df: Optional[pd.DataFrame
 
     init_db()
     date_str = pd.to_datetime(date).normalize().date().isoformat()
-    with get_connection() as conn:
+    with _ENGINE.connect() as conn:
         row = conn.execute(
-            "SELECT 1 FROM discipline_completions "
-            "WHERE lower(trim(task)) = lower(trim(?)) AND completed_date = ? LIMIT 1",
-            (task_name, date_str),
-        ).fetchone()
+            text(
+                "SELECT 1 FROM discipline_completions "
+                "WHERE lower(trim(task)) = lower(trim(:t)) AND completed_date = :d LIMIT 1"
+            ),
+            {"t": task_name, "d": date_str},
+        ).first()
     return row is not None
 
 
 def load_discipline_completion_df() -> pd.DataFrame:
     """Return the long-format completion DataFrame the bot uses for weekly/streak math."""
     init_db()
-    with get_connection() as conn:
+    with _ENGINE.connect() as conn:
         df = pd.read_sql_query(
-            "SELECT task, catagory, completed_date, logged_at FROM discipline_completions "
-            "ORDER BY completed_date ASC",
+            text(
+                "SELECT task, catagory, completed_date, logged_at "
+                "FROM discipline_completions ORDER BY completed_date ASC"
+            ),
             conn,
         )
     if df.empty:
@@ -614,9 +677,6 @@ def read_discipline_history() -> pd.DataFrame:
     """Rebuild the wide history matrix (DatetimeIndex x task columns) from
     the long completions table. True where a completion row exists, pd.NA
     before that task's first-ever completion, False otherwise.
-
-    Downstream discipline code (streaks, heatmap, category rollups) reads this
-    matrix — we preserve the same shape it had when it was a pickle.
     """
     long_df = load_discipline_completion_df()
     if long_df.empty:
@@ -635,10 +695,8 @@ def read_discipline_history() -> pd.DataFrame:
     all_dates = pd.date_range(min_date, max_date, freq="D", name="DATE")
     tasks_sorted = sorted(long_df["TASK"].unique())
 
-    # object dtype so we can hold True / False / pd.NA together
     history_df = pd.DataFrame(False, index=all_dates, columns=tasks_sorted, dtype="object")
 
-    # Mark cells before a task's first completion as NA (task wasn't tracked yet).
     first_seen = long_df.groupby("TASK")["COMPLETED_DATE"].min()
     for task, first_date in first_seen.items():
         history_df.loc[history_df.index < first_date, task] = pd.NA
@@ -653,8 +711,10 @@ def read_discipline_history() -> pd.DataFrame:
 
 def load_follow_ups() -> pd.DataFrame:
     init_db()
-    with get_connection() as conn:
-        df = pd.read_sql_query("SELECT * FROM follow_up_tasks ORDER BY id ASC", conn)
+    with _ENGINE.connect() as conn:
+        df = pd.read_sql_query(
+            text("SELECT * FROM follow_up_tasks ORDER BY id ASC"), conn
+        )
     if df.empty:
         return _empty_follow_up_df()
     if "id" in df.columns:
@@ -676,44 +736,43 @@ def load_follow_ups() -> pd.DataFrame:
 
 def save_follow_ups(df: pd.DataFrame) -> None:
     init_db()
-    with get_connection() as conn:
-        conn.execute("BEGIN")
-        try:
-            conn.execute("DELETE FROM follow_up_tasks")
-            if df is not None and not df.empty:
-                params = []
-                for _, row in df.iterrows():
-                    params.append(
-                        (
-                            None if pd.isna(row.get("TRIGGER_TASK")) else str(row.get("TRIGGER_TASK")),
-                            None if pd.isna(row.get("FOLLOW_UP_TASK")) else str(row.get("FOLLOW_UP_TASK")),
-                            None if pd.isna(row.get("CATAGORY")) else (str(row.get("CATAGORY")) if row.get("CATAGORY") is not None else None),
-                            None if pd.isna(row.get("GROUP")) else (str(row.get("GROUP")) if row.get("GROUP") is not None else None),
-                            None if pd.isna(row.get("SUBGROUP")) else (str(row.get("SUBGROUP")) if row.get("SUBGROUP") is not None else None),
-                            None if pd.isna(row.get("RELEVANT_LINK")) else (str(row.get("RELEVANT_LINK")) if row.get("RELEVANT_LINK") is not None else None),
-                            _to_int_or_none(row.get("PRIORITY")) or 1,
-                            _to_float_or_none(row.get("ESTIMATED_TIME")),
-                            _to_int_or_none(row.get("DUE_OFFSET_DAYS")),
-                            _iso_or_none(pd.to_datetime(row.get("CREATED"), errors="coerce") if row.get("CREATED") is not None else None),
-                        )
-                    )
-                conn.executemany(
-                    "INSERT INTO follow_up_tasks "
-                    "(trigger_task, follow_up_task, catagory, task_group, subgroup, "
-                    " relevant_link, priority, estimated_time, due_offset_days, created) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    params,
+    insert_sql = text(
+        "INSERT INTO follow_up_tasks "
+        "(trigger_task, follow_up_task, catagory, task_group, subgroup, "
+        " relevant_link, priority, estimated_time, due_offset_days, created) "
+        "VALUES (:trigger_task, :follow_up_task, :catagory, :task_group, :subgroup, "
+        " :relevant_link, :priority, :estimated_time, :due_offset_days, :created)"
+    )
+    with _ENGINE.begin() as conn:
+        conn.execute(text("DELETE FROM follow_up_tasks"))
+        if df is not None and not df.empty:
+            params = []
+            for _, row in df.iterrows():
+                params.append(
+                    {
+                        "trigger_task": None if pd.isna(row.get("TRIGGER_TASK")) else str(row.get("TRIGGER_TASK")),
+                        "follow_up_task": None if pd.isna(row.get("FOLLOW_UP_TASK")) else str(row.get("FOLLOW_UP_TASK")),
+                        "catagory": None if pd.isna(row.get("CATAGORY")) else str(row.get("CATAGORY")),
+                        "task_group": None if pd.isna(row.get("GROUP")) else str(row.get("GROUP")),
+                        "subgroup": None if pd.isna(row.get("SUBGROUP")) else str(row.get("SUBGROUP")),
+                        "relevant_link": None if pd.isna(row.get("RELEVANT_LINK")) else str(row.get("RELEVANT_LINK")),
+                        "priority": _to_int_or_none(row.get("PRIORITY")) or 1,
+                        "estimated_time": _to_float_or_none(row.get("ESTIMATED_TIME")),
+                        "due_offset_days": _to_int_or_none(row.get("DUE_OFFSET_DAYS")),
+                        "created": _iso_or_none(
+                            pd.to_datetime(row.get("CREATED"), errors="coerce")
+                            if row.get("CREATED") is not None
+                            else None
+                        ),
+                    }
                 )
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
+            conn.execute(insert_sql, params)
 
 
 # --- Introspection helpers (used by migration script + tests) ---------------
 
 def table_row_count(table_name: str) -> int:
     init_db()
-    with get_connection() as conn:
-        row = conn.execute(f"SELECT COUNT(*) AS n FROM {table_name}").fetchone()
-    return int(row["n"] or 0)
+    with _ENGINE.connect() as conn:
+        row = conn.execute(text(f"SELECT COUNT(*) AS n FROM {table_name}")).first()
+    return int(row.n or 0)
