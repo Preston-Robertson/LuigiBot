@@ -1,5 +1,6 @@
 """Shared configuration loaded from config.json — imported by all modules."""
 import json
+import os
 from pathlib import PurePosixPath, PureWindowsPath, Path
 
 # Project root = parent of the bot_modules/ folder this file lives in.
@@ -37,6 +38,14 @@ path_for_follow_up_tasks = _normalize_path(config.get("Follow_Up_Tasks_Path"), "
 path_for_discipline_list = _normalize_path(config.get("Discipline_List_Path"), "to_do_list/discipline_list.pkl")
 path_for_discipline_completion_log = _normalize_path(config.get("Discipline_Completion_Log_Path"), "to_do_list/discipline_completion_log.pkl")
 path_for_discipline_history = _normalize_path(config.get("Discipline_History_Path"), "to_do_list/discipline_history.pkl")
+
+# SQLite database. Env var LUIGI_DB_PATH wins, then config.json "Database_Path",
+# then project-local default (<repo>/luigi.db) so dev works out of the box.
+# On the Linux host, override via config.json to e.g. "/mnt/luigi/luigi.db".
+database_path = os.environ.get(
+    "LUIGI_DB_PATH",
+    _normalize_path(config.get("Database_Path"), "luigi.db"),
+)
 
 discipline_delete_after_seconds = int(config.get("Discipline_Delete_After_Seconds", 7200))
 discipline_daily_hour = int(config.get("Discipline_Daily_Hour", 23))

@@ -1,4 +1,10 @@
-"""Discipline tracker data helpers — row builders, data processing, streaks, embeds."""
+"""Discipline tracker data helpers — row builders, data processing, streaks, embeds.
+
+Data persistence lives in `bot_modules.db` (SQLite). The `ensure_*` /
+`read_discipline_history` / `set_discipline_cell` / `is_task_completed_on` /
+`load_discipline_completion_df` names are kept for call-site compatibility;
+they just delegate to the DB layer.
+"""
 import os
 import datetime
 
@@ -11,6 +17,7 @@ from .bot_config import (
     path_for_discipline_completion_log,
     path_for_discipline_history,
 )
+from . import db
 
 
 # --- Row Builders ---
@@ -40,180 +47,45 @@ def build_discipline_completion_row(task_name, catagory, completed_date):
 
 
 # --- File Initialization ---
+# Kept as callable functions for backward compatibility with existing call
+# sites; the real work is `db.init_db()` (idempotent, cheap after first call).
 
 def ensure_discipline_dataframe_exists():
-    os.makedirs(os.path.dirname(path_for_discipline_list), exist_ok=True)
-
-    expected_cols = ["TASK", "CATAGORY", "FREQUENCY_PER_WEEK", "ACTIVE", "CURRENT_STREAK"]
-
-    if os.path.exists(path_for_discipline_list):
-        try:
-            existing_df = pd.read_pickle(path_for_discipline_list)
-            if set(expected_cols).issubset(existing_df.columns):
-                existing_df = existing_df[expected_cols].copy()
-                existing_df["FREQUENCY_PER_WEEK"] = pd.to_numeric(existing_df["FREQUENCY_PER_WEEK"], errors="coerce").fillna(1).astype(int)
-                existing_df["FREQUENCY_PER_WEEK"] = existing_df["FREQUENCY_PER_WEEK"].clip(lower=1, upper=7)
-                existing_df["ACTIVE"] = existing_df["ACTIVE"].astype(bool).fillna(True)
-                existing_df["CURRENT_STREAK"] = pd.to_numeric(existing_df["CURRENT_STREAK"], errors="coerce").fillna(0).astype(int)
-                existing_df.to_pickle(path_for_discipline_list)
-                return
-
-            migrated_df = pd.DataFrame(
-                {
-                    "TASK": existing_df["TASK"].astype(str) if "TASK" in existing_df.columns else pd.Series(dtype="object"),
-                    "CATAGORY": existing_df["CATAGORY"].astype(str) if "CATAGORY" in existing_df.columns else "Discipline",
-                    "FREQUENCY_PER_WEEK": 1,
-                    "ACTIVE": True,
-                    "CURRENT_STREAK": 0,
-                }
-            )
-            migrated_df.to_pickle(path_for_discipline_list)
-            return
-        except Exception:
-            pass
-
-    pd.DataFrame(columns=expected_cols).to_pickle(path_for_discipline_list)
+    db.init_db()
 
 
 def ensure_discipline_completion_log_exists():
-    os.makedirs(os.path.dirname(path_for_discipline_completion_log), exist_ok=True)
-
-    expected_cols = ["TASK", "CATAGORY", "COMPLETED_DATE", "LOGGED_AT"]
-
-    if os.path.exists(path_for_discipline_completion_log):
-        try:
-            existing_df = pd.read_pickle(path_for_discipline_completion_log)
-            if set(expected_cols).issubset(existing_df.columns):
-                existing_df = existing_df[expected_cols].copy()
-                existing_df.to_pickle(path_for_discipline_completion_log)
-                return
-        except Exception:
-            pass
-
-    pd.DataFrame(columns=expected_cols).to_pickle(path_for_discipline_completion_log)
+    db.init_db()
 
 
-# --- Discipline History Matrix (source of truth) ---
-# Wide DataFrame: DatetimeIndex (one row per date) x discipline task columns.
-# Values: True = completed that day, False = not completed, pd.NA = task wasn't
-# tracked yet on that date. Built from the legacy long log on first run.
-
-def _empty_history_df():
-    return pd.DataFrame(index=pd.DatetimeIndex([], name="DATE"))
-
-
-def _migrate_legacy_log_to_history():
-    """Build a wide history matrix from the legacy long-format completion log."""
-    if not os.path.exists(path_for_discipline_completion_log):
-        return _empty_history_df()
-
-    try:
-        legacy = pd.read_pickle(path_for_discipline_completion_log)
-    except Exception:
-        return _empty_history_df()
-
-    if legacy.empty or "TASK" not in legacy.columns or "COMPLETED_DATE" not in legacy.columns:
-        return _empty_history_df()
-
-    legacy = legacy.copy()
-    legacy["TASK"] = legacy["TASK"].astype(str).str.strip()
-    legacy["COMPLETED_DATE"] = pd.to_datetime(legacy["COMPLETED_DATE"], errors="coerce").dt.normalize()
-    legacy = legacy.dropna(subset=["COMPLETED_DATE", "TASK"])
-    legacy = legacy.drop_duplicates(subset=["TASK", "COMPLETED_DATE"])
-
-    if legacy.empty:
-        return _empty_history_df()
-
-    min_date = legacy["COMPLETED_DATE"].min()
-    max_date = legacy["COMPLETED_DATE"].max()
-    today = pd.to_datetime(datetime.datetime.now().date()).normalize()
-    if today > max_date:
-        max_date = today
-
-    all_dates = pd.date_range(min_date, max_date, freq="D", name="DATE")
-    tasks = sorted(legacy["TASK"].unique())
-
-    # object dtype so we can hold True/False/pd.NA together
-    history_df = pd.DataFrame(False, index=all_dates, columns=tasks, dtype="object")
-
-    for task in tasks:
-        first_seen = legacy.loc[legacy["TASK"] == task, "COMPLETED_DATE"].min()
-        history_df.loc[history_df.index < first_seen, task] = pd.NA
-
-    for _, row in legacy.iterrows():
-        history_df.at[row["COMPLETED_DATE"], row["TASK"]] = True
-
-    return history_df
-
+# --- Discipline History Matrix (rebuilt from SQL on demand) ---
+# The wide DatetimeIndex x task matrix is no longer stored — it's projected
+# from `discipline_completions` in db.py. Downstream discipline code sees the
+# same DataFrame shape it always has.
 
 def ensure_discipline_history_exists():
-    """Create the discipline history matrix, migrating from the legacy log if needed."""
-    os.makedirs(os.path.dirname(path_for_discipline_history), exist_ok=True)
-
-    if os.path.exists(path_for_discipline_history):
-        try:
-            df = pd.read_pickle(path_for_discipline_history)
-            if isinstance(df.index, pd.DatetimeIndex):
-                return
-        except Exception:
-            pass  # fall through and rebuild
-
-    migrated = _migrate_legacy_log_to_history()
-    migrated.to_pickle(path_for_discipline_history)
+    db.init_db()
 
 
 def read_discipline_history():
-    """Return the history matrix (DatetimeIndex x task columns, values True/False/NA)."""
-    ensure_discipline_history_exists()
-    df = pd.read_pickle(path_for_discipline_history)
-    if not isinstance(df.index, pd.DatetimeIndex):
-        df.index = pd.to_datetime(df.index)
-        df.index.name = "DATE"
-    return df
+    return db.read_discipline_history()
 
 
 def write_discipline_history(history_df):
-    history_df.to_pickle(path_for_discipline_history)
+    """No-op — history is now derived from `discipline_completions` in SQL.
+
+    Kept so any lingering callers don't crash; state changes go through
+    `set_discipline_cell` / `db.append_discipline_completion` instead.
+    """
+    return None
 
 
 def set_discipline_cell(task_name, date, value):
-    """Mark/unmark task on date. Creates the row/column if missing. Returns updated matrix."""
-    history_df = read_discipline_history()
-    task_name = str(task_name).strip()
-    date = pd.to_datetime(date).normalize()
-
-    if task_name not in history_df.columns:
-        # New column: NA before today, will get value set below for `date`
-        history_df[task_name] = pd.NA
-        history_df[task_name] = history_df[task_name].astype("object")
-
-    if date not in history_df.index:
-        new_row = pd.DataFrame(
-            {col: [pd.NA] for col in history_df.columns},
-            index=pd.DatetimeIndex([date], name="DATE"),
-        )
-        history_df = pd.concat([history_df, new_row])
-        history_df = history_df.sort_index()
-        history_df.index = pd.to_datetime(history_df.index)
-        history_df.index.name = "DATE"
-
-    history_df.at[date, task_name] = bool(value)
-    write_discipline_history(history_df)
-    return history_df
+    return db.set_discipline_cell(task_name, date, value)
 
 
 def is_task_completed_on(task_name, date, history_df=None):
-    """True only if the cell is explicitly True. NA / missing / False -> False."""
-    if history_df is None:
-        history_df = read_discipline_history()
-    task_name = str(task_name).strip()
-    date = pd.to_datetime(date).normalize()
-    if task_name not in history_df.columns or date not in history_df.index:
-        return False
-    val = history_df.at[date, task_name]
-    if pd.isna(val):
-        return False
-    return bool(val)
+    return db.is_task_completed_on(task_name, date, history_df=history_df)
 
 
 def history_matrix_to_long_log(history_df, discipline_list_df=None):
@@ -260,18 +132,8 @@ def history_matrix_to_long_log(history_df, discipline_list_df=None):
 
 
 def load_discipline_completion_df():
-    """Backward-compatible shim: returns long-format completion df derived from the matrix.
-
-    Use this anywhere the old code expected `pd.read_pickle(path_for_discipline_completion_log)`.
-    """
-    history_df = read_discipline_history()
-    discipline_list_df = None
-    if os.path.exists(path_for_discipline_list):
-        try:
-            discipline_list_df = pd.read_pickle(path_for_discipline_list)
-        except Exception:
-            pass
-    return history_matrix_to_long_log(history_df, discipline_list_df)
+    """Return long-format completion DF straight from SQL."""
+    return db.load_discipline_completion_df()
 
 
 # --- Data Processing ---

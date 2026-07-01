@@ -3,29 +3,18 @@
 When a trigger task is completed, automatically create one or more follow-up
 tasks in the main to-do list (e.g. 'Do Dishes' -> 'Put up Dishes').
 
-Mappings live in a separate pickle so the to-do dataframe stays unchanged.
+Mappings live in the `follow_up_tasks` SQL table so the to-do dataframe stays
+unchanged.
 """
 import datetime
-import os
 
 import pandas as pd
 
-from .bot_config import path_for_follow_up_tasks, path_for_to_do_list
+from . import db
 from .task_helpers import build_tracker_row, normalize_due_date
 
 
-FOLLOW_UP_COLUMNS = [
-    "TRIGGER_TASK",
-    "FOLLOW_UP_TASK",
-    "CATAGORY",
-    "GROUP",
-    "SUBGROUP",
-    "RELEVANT_LINK",
-    "PRIORITY",
-    "ESTIMATED_TIME",
-    "DUE_OFFSET_DAYS",
-    "CREATED",
-]
+FOLLOW_UP_COLUMNS = db.FOLLOW_UP_DF_COLUMNS
 
 
 def _empty_follow_up_df():
@@ -33,23 +22,12 @@ def _empty_follow_up_df():
 
 
 def load_follow_ups():
-    """Return the follow-up mapping dataframe (creating an empty one if missing)."""
-    if not os.path.exists(path_for_follow_up_tasks):
-        return _empty_follow_up_df()
-    try:
-        df = pd.read_pickle(path_for_follow_up_tasks)
-    except Exception:
-        return _empty_follow_up_df()
-    # Ensure all expected columns exist (forward-compatible).
-    for col in FOLLOW_UP_COLUMNS:
-        if col not in df.columns:
-            df[col] = None
-    return df.reset_index(drop=True)
+    """Return the follow-up mapping dataframe (empty if none configured)."""
+    return db.load_follow_ups()
 
 
 def save_follow_ups(df):
-    df = df.reset_index(drop=True)
-    df.to_pickle(path_for_follow_up_tasks)
+    db.save_follow_ups(df.reset_index(drop=True))
 
 
 def add_follow_up(
@@ -137,8 +115,8 @@ def create_follow_up_tasks_for(trigger_task_name, source_row=None):
         return []
 
     try:
-        to_do_list_df = pd.read_pickle(path_for_to_do_list)
-    except FileNotFoundError:
+        to_do_list_df = db.load_tasks_df()
+    except Exception:
         to_do_list_df = pd.DataFrame()
 
     created_names = []
@@ -212,6 +190,6 @@ def create_follow_up_tasks_for(trigger_task_name, source_row=None):
         open_task_names.append(follow_up_name.lower())
 
     if created_names:
-        to_do_list_df.to_pickle(path_for_to_do_list)
+        db.save_tasks_df(to_do_list_df)
 
     return created_names

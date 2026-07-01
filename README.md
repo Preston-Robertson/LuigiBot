@@ -22,21 +22,19 @@ A personal Discord bot for managing a to-do list and a separate discipline track
 ```text
 LuigiBot/
 |-- main.py                       # Bot instance, commands, scheduler, event handlers
+|-- luigi.db                      # SQLite database (single source of truth for all bot data)
 |-- bot_modules/                  # Helper package
 |   |-- __init__.py
-|   |-- bot_config.py             # Shared config (paths, channel IDs, prefix)
+|   |-- bot_config.py             # Shared config (paths, channel IDs, prefix, database_path)
+|   |-- db.py                     # SQLite persistence layer (all reads/writes go through here)
 |   |-- chart_rendering.py        # Visual theme + all chart rendering functions
 |   |-- discipline_helpers.py     # Discipline data processing, streaks, embeds
+|   |-- follow_up_helpers.py      # Follow-up task creation helpers
 |   |-- task_helpers.py           # To-do row builders, series builder, task embeds
 |   |-- ui_components.py          # Discord Button/View classes
 |   `-- required_functions.py     # Utility: extract_task_name
 |-- requirements.txt
-|-- config.json
-`-- to_do_list/
-    |-- to_do_list.pkl
-    |-- recurring_tasks.pkl
-    |-- discipline_list.pkl
-    `-- discipline_completion_log.pkl
+`-- config.json
 ```
 
 ## Prerequisites
@@ -67,8 +65,7 @@ pip install -r requirements.txt
   "Channel_ID": 123456789012345678,
   "Channel_ID_to_do": 123456789012345678,
   "Channel_ID_discipline": 123456789012345678,
-  "Discipline_List_Path": "to_do_list\\discipline_list.pkl",
-  "Discipline_Completion_Log_Path": "to_do_list\\discipline_completion_log.pkl",
+  "Database_Path": "luigi.db",
   "Discipline_Delete_After_Seconds": 7200,
   "Discipline_Daily_Hour": 23,
   "Discipline_Daily_Minute": 15,
@@ -79,13 +76,10 @@ pip install -r requirements.txt
 }
 ```
 
-3. Ensure the data folder exists.
+`Database_Path` is optional and defaults to `<repo>/luigi.db`. The `LUIGI_DB_PATH`
+environment variable, if set, overrides the config value.
 
-```bash
-mkdir to_do_list
-```
-
-4. Run the bot.
+3. Run the bot. The database file and its schema are created automatically on first run.
 
 ```bash
 python main.py
@@ -203,20 +197,126 @@ When you run the to-do list command, LuigiBot shows numbered task buttons. Selec
 - 11:30 PM: 15-minute post check-in discipline goal-status snapshot
 - 5:00 PM Thursday: Midweek at-risk discipline nudge (configurable via `Discipline_At_Risk_*` keys)
 
-## Discipline Data Model
+## Data Storage
 
-Discipline active list (`discipline_list.pkl`):
+All bot state lives in a single SQLite database at `luigi.db` (project root by default).
+Every module reads and writes through `bot_modules/db.py` — nothing else touches the
+file directly. This makes it safe for a future web UI (e.g. FastAPI) to open the same
+database in read-only mode without stepping on the running bot.
 
-- `TASK`
-- `CATAGORY`
-- `FREQUENCY_PER_WEEK`
+### Runtime characteristics
 
-Discipline completion log (`discipline_completion_log.pkl`):
+- **WAL mode** with `synchronous=NORMAL` and `busy_timeout=30000` — concurrent readers
+  (bot + external tools) do not block each other.
+- **Foreign keys enabled** and one connection per operation. Discord.py's asyncio
+  callbacks all get a fresh, short-lived connection, so there is no cross-thread
+  cursor sharing.
+- **Whole-DataFrame save pattern**: `db.save_tasks_df(df)` etc. run a transactional
+  `DELETE` + `executemany INSERT`. This is fine at current row counts (tens to low
+  hundreds) and lets the existing "load whole df, mutate, save whole df" call sites
+  work unchanged.
 
-- `TASK`
-- `CATAGORY`
-- `COMPLETED_DATE`
-- `LOGGED_AT`
+### Column naming
+
+- **SQL columns are `snake_case`** because `GROUP` is a reserved word and mixed-case
+  identifiers are painful in raw SQL. `group` becomes `task_group`, `SUB-GROUP` becomes
+  `sub_group`, `RELEVANT LINK` becomes `relevant_link`.
+- **DataFrame columns preserve the bot's historical spellings** (including the
+  `CATAGORY` typo, ALL-CAPS names, and the space in `RELEVANT LINK`). Mapping
+  dictionaries in `db.py` translate between the two on read/write.
+- **Dates and timestamps** are stored as ISO-8601 `TEXT` and parsed back into pandas
+  `Timestamp` on read.
+- **Booleans** are stored as `INTEGER` 0/1 and coerced to `bool` on read.
+
+### Schema
+
+Schema version is tracked in the `schema_version` table (currently `1`).
+
+#### `tasks` — active and completed to-do items
+
+| SQL column           | DataFrame column      | Type      | Notes                                                     |
+| -------------------- | --------------------- | --------- | --------------------------------------------------------- |
+| `id`                 | *(index)*             | INTEGER   | Primary key, autoincrement.                               |
+| `task`               | `TASK`                | TEXT      | Required. Task name.                                      |
+| `priority`           | `PRIORITY`            | INTEGER   | 1–10. Default 1.                                          |
+| `status`             | `STATUS`              | TEXT      | `Not Started`, `In Progress`, `Pending`, `Blocked`, `Hiatus`, `Completed`. |
+| `due_date`           | `DUE DATE`            | TEXT      | ISO date, or `NULL`.                                      |
+| `relevant_link`      | `RELEVANT LINK`       | TEXT      | Optional URL.                                             |
+| `catagory`           | `CATAGORY`            | TEXT      | Free-form category (typo preserved intentionally).        |
+| `task_group`         | `GROUP`               | TEXT      | Free-form group.                                          |
+| `sub_group`          | `SUB-GROUP`           | TEXT      | Free-form subgroup.                                       |
+| `task_creation`      | `TASK CREATION`       | TEXT      | ISO timestamp set on insert.                              |
+| `start_time`         | `START TIME`          | TEXT      | ISO timestamp when the task last moved to `In Progress`.  |
+| `estimated_time`     | `ESTIMATED TIME`      | REAL      | Estimated hours.                                          |
+| `logged_hours`       | `LOGGED HOURS`        | REAL      | Accumulated hours logged. Default 0.                      |
+| `completed`          | `COMPLETED`           | INTEGER   | 0/1 boolean. Default 0.                                   |
+| `completed_time`     | `COMPLETED TIME`      | TEXT      | ISO timestamp when task moved to `Completed`.             |
+| `recurring`          | `RECURRING`           | INTEGER   | 0/1 boolean. Default 0.                                   |
+| `recurring_interval` | `RECURRING INTERVAL`  | INTEGER   | Days between recurrences.                                 |
+
+Indexes: `idx_tasks_status`, `idx_tasks_due`.
+
+#### `recurring_tasks` — template rows re-added on their cadence
+
+Same column shape as `tasks`, but `recurring` defaults to 1. The 7:45 AM scheduler
+reads this table and appends due rows into `tasks`.
+
+#### `discipline_list` — the active discipline tracker
+
+| SQL column           | DataFrame column     | Type    | Notes                                             |
+| -------------------- | -------------------- | ------- | ------------------------------------------------- |
+| `id`                 | *(index)*            | INTEGER | Primary key, autoincrement.                       |
+| `task`               | `TASK`               | TEXT    | Required. Discipline name (e.g. `Deep Work`).     |
+| `catagory`           | `CATAGORY`           | TEXT    | Free-form category (e.g. `Focus`, `Health`).      |
+| `frequency_per_week` | `FREQUENCY_PER_WEEK` | INTEGER | Weekly target count. Default 1.                   |
+| `active`             | `ACTIVE`             | INTEGER | 0/1 boolean. Default 1.                           |
+| `current_streak`     | `CURRENT_STREAK`     | INTEGER | Refreshed every time a completion is logged.      |
+
+#### `discipline_completions` — long-format completion log (source of truth)
+
+| SQL column       | DataFrame column | Type    | Notes                                        |
+| ---------------- | ---------------- | ------- | -------------------------------------------- |
+| `id`             | *(index)*        | INTEGER | Primary key, autoincrement.                  |
+| `task`           | `TASK`           | TEXT    | Required. Matches a `discipline_list.task`.  |
+| `catagory`       | `CATAGORY`       | TEXT    | Snapshot of category at log time.            |
+| `completed_date` | `COMPLETED_DATE` | TEXT    | ISO date. Required.                          |
+| `logged_at`      | `LOGGED_AT`      | TEXT    | ISO timestamp of the log call.               |
+
+Constraint: `UNIQUE(task, completed_date)` — one completion per task per day.
+Indexes: `idx_disc_comp_date`, `idx_disc_comp_task`.
+
+The old wide-format history matrix (one row per day, one column per discipline, `True/False/NA`)
+is **not** stored as a table. `db.read_discipline_history()` rebuilds it on demand by
+pivoting this table, so every downstream visual and streak calculation keeps working
+unchanged.
+
+#### `follow_up_tasks` — pending follow-up task definitions
+
+| SQL column         | DataFrame column   | Type    | Notes                                                    |
+| ------------------ | ------------------ | ------- | -------------------------------------------------------- |
+| `id`               | *(index)*          | INTEGER | Primary key, autoincrement.                              |
+| `trigger_task`     | `TRIGGER_TASK`     | TEXT    | The task whose completion triggers the follow-up.        |
+| `follow_up_task`   | `FOLLOW_UP_TASK`   | TEXT    | Task name to create when the trigger completes.          |
+| `catagory`         | `CATAGORY`         | TEXT    | Category for the created task.                           |
+| `task_group`       | `GROUP`            | TEXT    | Group for the created task.                              |
+| `subgroup`         | `SUB-GROUP`        | TEXT    | Subgroup for the created task.                           |
+| `relevant_link`    | `RELEVANT LINK`    | TEXT    | Optional URL.                                            |
+| `priority`         | `PRIORITY`         | INTEGER | Priority for the created task. Default 1.                |
+| `estimated_time`   | `ESTIMATED TIME`   | REAL    | Estimated hours for the created task.                    |
+| `due_offset_days`  | `DUE_OFFSET_DAYS`  | INTEGER | Days after trigger completion to set the due date.       |
+| `created`          | `CREATED`          | TEXT    | ISO timestamp when the follow-up definition was added.   |
+
+#### `schema_version`
+
+Single-row table with an `INTEGER` version. Bumping this in `db.py` alongside a
+migration is how future schema changes will be gated.
+
+### Backups
+
+SQLite makes backups trivial — while the bot is stopped, copy `luigi.db` (and the
+`.db-wal` / `.db-shm` files if present) to any location. To back up while the bot
+is running, use `sqlite3 luigi.db ".backup 'backup.db'"` — the online backup API
+is safe against the WAL.
 
 ## Notes
 

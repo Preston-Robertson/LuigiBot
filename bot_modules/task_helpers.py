@@ -4,7 +4,15 @@ import datetime
 import discord
 import pandas as pd
 
-from .bot_config import path_for_to_do_list
+from . import db
+
+
+# Re-exported so callers can `from bot_modules.task_helpers import load_tasks_df`
+# without needing to know about db.py directly.
+load_tasks_df = db.load_tasks_df
+save_tasks_df = db.save_tasks_df
+load_recurring_df = db.load_recurring_df
+save_recurring_df = db.save_recurring_df
 
 
 # --- Row Builder ---
@@ -91,7 +99,7 @@ def get_open_task_mask(to_do_list_df, task_name):
 
 
 def load_latest_task_row(task_name):
-    to_do_list_df = pd.read_pickle(path_for_to_do_list)
+    to_do_list_df = db.load_tasks_df()
     task_df = to_do_list_df[to_do_list_df["TASK"] == task_name].copy()
     if task_df.empty:
         return None

@@ -4,11 +4,8 @@ import datetime
 import discord
 import pandas as pd
 
-from .bot_config import (
-    command_prefix,
-    path_for_to_do_list,
-    path_for_discipline_list,
-)
+from .bot_config import command_prefix
+from . import db
 from .task_helpers import get_open_task_mask, pause_task_tracking, load_latest_task_row, build_task_detail_embed
 from .follow_up_helpers import create_follow_up_tasks_for
 from .discipline_helpers import (
@@ -28,7 +25,7 @@ class TaskSelectButton(discord.ui.Button):
         self.index = index
 
     async def callback(self, interaction: discord.Interaction):
-        to_do_list_df = pd.read_pickle(path_for_to_do_list)
+        to_do_list_df = db.load_tasks_df()
         filtered_df = to_do_list_df[to_do_list_df["STATUS"] != "Completed"]
         sorted_df = filtered_df.sort_values(by=["PRIORITY", "DUE DATE"], ascending=[False, True])
         if self.index >= len(sorted_df):
@@ -70,13 +67,13 @@ class TaskActionView(discord.ui.View):
         self.task_name = task_name
 
     async def _persist_and_ack(self, interaction, to_do_list_df, message):
-        to_do_list_df.to_pickle(path_for_to_do_list)
+        db.save_tasks_df(to_do_list_df)
         await interaction.response.edit_message(content=message, embed=None, view=None)
         msg = await interaction.original_response()
         await msg.delete(delay=30)
 
     async def _load_open_task_df(self, interaction):
-        to_do_list_df = pd.read_pickle(path_for_to_do_list)
+        to_do_list_df = db.load_tasks_df()
         task_mask = get_open_task_mask(to_do_list_df, self.task_name)
         if task_mask.sum() == 0:
             await interaction.response.send_message("Task no longer exists or is already completed.", ephemeral=True)
@@ -108,7 +105,7 @@ class TaskActionView(discord.ui.View):
         pause_task_tracking(to_do_list_df, task_mask, completion_timestamp)
         to_do_list_df.loc[task_mask, "COMPLETED TIME"] = completion_timestamp
         to_do_list_df.loc[task_mask, "STATUS"] = "Completed"
-        to_do_list_df.to_pickle(path_for_to_do_list)
+        db.save_tasks_df(to_do_list_df)
 
         # Auto-create any follow-up tasks tied to this trigger (e.g. Do Dishes -> Put up Dishes).
         created_follow_ups = []
@@ -187,7 +184,7 @@ class DisciplineTaskButton(discord.ui.Button):
         is_logged = is_task_completed_on(self.task_name, today, history_df)
 
         # Verify task still exists in the discipline list before creating a new column.
-        discipline_df = pd.read_pickle(path_for_discipline_list)
+        discipline_df = db.load_discipline_df()
         task_match = discipline_df[discipline_df["TASK"].astype(str).str.lower() == str(self.task_name).strip().lower()]
         if task_match.empty and not is_logged:
             await interaction.response.send_message(
