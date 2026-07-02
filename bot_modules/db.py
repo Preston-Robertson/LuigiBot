@@ -209,8 +209,15 @@ def init_db() -> None:
                 exist_ok=True,
             )
         with _ENGINE.begin() as conn:
-            for stmt in _ddl_statements():
-                conn.execute(text(stmt))
+            # On Postgres, CREATE INDEX (even IF NOT EXISTS) requires table
+            # ownership. When the schema is pre-provisioned by a different
+            # role (limited DML-only bot user), skip DDL entirely.
+            skip_ddl = _IS_POSTGRES and conn.execute(
+                text("SELECT to_regclass('public.tasks')")
+            ).scalar() is not None
+            if not skip_ddl:
+                for stmt in _ddl_statements():
+                    conn.execute(text(stmt))
             existing = conn.execute(
                 text("SELECT version FROM schema_version LIMIT 1")
             ).first()
