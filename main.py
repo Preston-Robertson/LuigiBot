@@ -235,7 +235,7 @@ async def to_do_list(ctx):
 
         count += 1
     
-    await ctx.channel.send(embed=embed, view=TaskSelectView(count), delete_after=60)
+    await ctx.send(embed=embed, view=TaskSelectView(count), delete_after=60)
 
 
 
