@@ -8,5 +8,8 @@ matplotlib>=3.8
 SQLAlchemy>=2.0
 psycopg[binary]>=3.1
 
+# Loads <repo>/.env into os.environ at import (see bot_modules/bot_config.py).
+python-dotenv>=1.0
+
 # Optional: notebook tools used in to_do_list/*.ipynb playgrounds
 ipykernel>=6.0

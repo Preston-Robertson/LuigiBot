@@ -5,3 +5,5 @@ __pycache__/
 temp_preview
 .venv/
 luigi.db
+.env
+.env

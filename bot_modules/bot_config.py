@@ -8,6 +8,14 @@ from pathlib import PurePosixPath, PureWindowsPath, Path
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _TO_DO_DIR = _PROJECT_ROOT / "to_do_list"
 
+# Load <repo>/.env into os.environ before any env-var reads below. Real process
+# env wins (override=False), so systemd/CI values still take precedence.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(_PROJECT_ROOT / ".env", override=False)
+except ImportError:
+    pass
+
 
 def _normalize_path(raw, default_relative):
     """Accept any path string (Windows or POSIX style) from config and return
