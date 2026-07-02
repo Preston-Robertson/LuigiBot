@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import os
 import threading
+import uuid as _uuid
 from typing import Iterable, Optional
 
 import pandas as pd
@@ -46,7 +47,12 @@ from .bot_config import (
 )
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+# Tables that use whole-DataFrame replace + carry a stable `uuid` (schema v2).
+# `discipline_completions` is intentionally excluded (append-only with its own
+# natural key `UNIQUE(task, completed_date)`).
+_UUID_TABLES = ("tasks", "recurring_tasks", "discipline_list", "follow_up_tasks")
 
 _INIT_LOCK = threading.Lock()
 _INITIALIZED = False
@@ -128,7 +134,8 @@ def _ddl_statements() -> list[str]:
             completed          INTEGER DEFAULT 0,
             completed_time     TEXT,
             recurring          INTEGER DEFAULT 0,
-            recurring_interval INTEGER
+            recurring_interval INTEGER,
+            uuid               TEXT
         )
         """,
         "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)",
@@ -151,7 +158,8 @@ def _ddl_statements() -> list[str]:
             completed          INTEGER DEFAULT 0,
             completed_time     TEXT,
             recurring          INTEGER DEFAULT 1,
-            recurring_interval INTEGER
+            recurring_interval INTEGER,
+            uuid               TEXT
         )
         """,
         f"""
@@ -161,7 +169,8 @@ def _ddl_statements() -> list[str]:
             catagory           TEXT,
             frequency_per_week INTEGER DEFAULT 1,
             active             INTEGER DEFAULT 1,
-            current_streak     INTEGER DEFAULT 0
+            current_streak     INTEGER DEFAULT 0,
+            uuid               TEXT
         )
         """,
         f"""
@@ -188,11 +197,60 @@ def _ddl_statements() -> list[str]:
             priority        INTEGER DEFAULT 1,
             estimated_time  REAL,
             due_offset_days INTEGER,
-            created         TEXT
+            created         TEXT,
+            uuid            TEXT
         )
         """,
         "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)",
     ]
+
+
+def _column_exists(conn, table: str, column: str) -> bool:
+    """Dialect-agnostic column existence check (SQLite pragma / PG info_schema)."""
+    if _IS_POSTGRES:
+        row = conn.execute(
+            text(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_schema = current_schema() "
+                "  AND table_name = :t AND column_name = :c LIMIT 1"
+            ),
+            {"t": table, "c": column},
+        ).first()
+    else:
+        row = conn.execute(
+            text("SELECT 1 FROM pragma_table_info(:t) WHERE name = :c LIMIT 1"),
+            {"t": table, "c": column},
+        ).first()
+    return row is not None
+
+
+def _migrate_to_v2(conn) -> None:
+    """Idempotent v1 -> v2 migration: add `uuid TEXT`, backfill, add unique index.
+
+    Owns the uuid indexes for both fresh (v0 -> v2) and legacy (v1 -> v2) paths
+    so DDL never tries to index a column that hasn't been ALTERed in yet. Safe
+    to run repeatedly. Backfill is done in Python for dialect uniformity and
+    runs BEFORE the unique index is created so legacy nulls don't collide.
+    """
+    # 1. Add the column where missing.
+    for table in _UUID_TABLES:
+        if not _column_exists(conn, table, "uuid"):
+            conn.execute(text(f"ALTER TABLE {table} ADD COLUMN uuid TEXT"))
+    # 2. Backfill NULL uuids row-by-row (dialect-uniform).
+    for table in _UUID_TABLES:
+        null_rows = conn.execute(
+            text(f"SELECT id FROM {table} WHERE uuid IS NULL")
+        ).all()
+        for r in null_rows:
+            conn.execute(
+                text(f"UPDATE {table} SET uuid = :u WHERE id = :i"),
+                {"u": str(_uuid.uuid4()), "i": r.id},
+            )
+    # 3. Ensure the unique index exists (no-op if DDL already created it).
+    for table in _UUID_TABLES:
+        conn.execute(
+            text(f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{table}_uuid ON {table}(uuid)")
+        )
 
 
 def init_db() -> None:
@@ -221,11 +279,20 @@ def init_db() -> None:
             existing = conn.execute(
                 text("SELECT version FROM schema_version LIMIT 1")
             ).first()
-            if existing is None:
-                conn.execute(
-                    text("INSERT INTO schema_version (version) VALUES (:v)"),
-                    {"v": SCHEMA_VERSION},
-                )
+            current_version = int(existing.version) if existing is not None else 0
+            if current_version < SCHEMA_VERSION:
+                # Run migration (safe on fresh DBs too — becomes a no-op there).
+                _migrate_to_v2(conn)
+                if existing is None:
+                    conn.execute(
+                        text("INSERT INTO schema_version (version) VALUES (:v)"),
+                        {"v": SCHEMA_VERSION},
+                    )
+                else:
+                    conn.execute(
+                        text("UPDATE schema_version SET version = :v"),
+                        {"v": SCHEMA_VERSION},
+                    )
         _INITIALIZED = True
 
 
@@ -250,6 +317,7 @@ _TASKS_SQL_TO_DF = {
     "completed_time": "COMPLETED TIME",
     "recurring": "RECURRING",
     "recurring_interval": "RECURRING INTERVAL",
+    "uuid": "UUID",
 }
 _TASKS_DF_TO_SQL = {v: k for k, v in _TASKS_SQL_TO_DF.items()}
 
@@ -264,6 +332,7 @@ _DISCIPLINE_SQL_TO_DF = {
     "frequency_per_week": "FREQUENCY_PER_WEEK",
     "active": "ACTIVE",
     "current_streak": "CURRENT_STREAK",
+    "uuid": "UUID",
 }
 _DISCIPLINE_DF_TO_SQL = {v: k for k, v in _DISCIPLINE_SQL_TO_DF.items()}
 
@@ -286,6 +355,7 @@ _FOLLOW_UP_SQL_TO_DF = {
     "estimated_time": "ESTIMATED_TIME",
     "due_offset_days": "DUE_OFFSET_DAYS",
     "created": "CREATED",
+    "uuid": "UUID",
 }
 _FOLLOW_UP_DF_TO_SQL = {v: k for k, v in _FOLLOW_UP_SQL_TO_DF.items()}
 
@@ -300,6 +370,7 @@ FOLLOW_UP_DF_COLUMNS = [
     "ESTIMATED_TIME",
     "DUE_OFFSET_DAYS",
     "CREATED",
+    "UUID",
 ]
 
 TASK_DF_COLUMNS = [
@@ -319,9 +390,10 @@ TASK_DF_COLUMNS = [
     "LOGGED HOURS",
     "COMPLETED",
     "COMPLETED TIME",
+    "UUID",
 ]
 
-DISCIPLINE_DF_COLUMNS = ["TASK", "CATAGORY", "FREQUENCY_PER_WEEK", "ACTIVE", "CURRENT_STREAK"]
+DISCIPLINE_DF_COLUMNS = ["TASK", "CATAGORY", "FREQUENCY_PER_WEEK", "ACTIVE", "CURRENT_STREAK", "UUID"]
 COMPLETION_DF_COLUMNS = ["TASK", "CATAGORY", "COMPLETED_DATE", "LOGGED_AT"]
 
 
@@ -384,13 +456,33 @@ def _to_float_or_none(value):
         return None
 
 
+def _uuid_or_new(value) -> str:
+    """Return an existing uuid string, or mint a fresh uuid4 if missing/blank.
+
+    This is what makes uuids survive the whole-table-rewrite save pattern: rows
+    coming back from `load_*` carry their uuid, and rows built fresh by the bot
+    (no uuid yet) get one minted on first save.
+    """
+    if value is None:
+        return str(_uuid.uuid4())
+    try:
+        if pd.isna(value):
+            return str(_uuid.uuid4())
+    except (TypeError, ValueError):
+        pass
+    s = str(value).strip()
+    return s if s else str(_uuid.uuid4())
+
+
 def _tasks_row_to_sql_params(row: pd.Series, sql_columns: Iterable[str]) -> dict:
     """Convert a task-shaped Series -> dict keyed by SQL column names."""
     out: dict = {}
     for sql_col in sql_columns:
         df_col = _TASKS_SQL_TO_DF[sql_col]
         value = row.get(df_col)
-        if df_col in _TASKS_BOOL_COLUMNS:
+        if sql_col == "uuid":
+            out[sql_col] = _uuid_or_new(value)
+        elif df_col in _TASKS_BOOL_COLUMNS:
             out[sql_col] = _to_bool_int(value)
         elif df_col in _TASKS_INT_COLUMNS:
             out[sql_col] = _to_int_or_none(value)
@@ -526,8 +618,8 @@ def save_discipline_df(df: pd.DataFrame) -> None:
     init_db()
     insert_sql = text(
         "INSERT INTO discipline_list "
-        "(task, catagory, frequency_per_week, active, current_streak) "
-        "VALUES (:task, :catagory, :frequency_per_week, :active, :current_streak)"
+        "(task, catagory, frequency_per_week, active, current_streak, uuid) "
+        "VALUES (:task, :catagory, :frequency_per_week, :active, :current_streak, :uuid)"
     )
     with _ENGINE.begin() as conn:
         conn.execute(text("DELETE FROM discipline_list"))
@@ -543,6 +635,7 @@ def save_discipline_df(df: pd.DataFrame) -> None:
                             row.get("ACTIVE") if not pd.isna(row.get("ACTIVE")) else True
                         ),
                         "current_streak": _to_int_or_none(row.get("CURRENT_STREAK")) or 0,
+                        "uuid": _uuid_or_new(row.get("UUID")),
                     }
                 )
             conn.execute(insert_sql, params)
@@ -746,9 +839,9 @@ def save_follow_ups(df: pd.DataFrame) -> None:
     insert_sql = text(
         "INSERT INTO follow_up_tasks "
         "(trigger_task, follow_up_task, catagory, task_group, subgroup, "
-        " relevant_link, priority, estimated_time, due_offset_days, created) "
+        " relevant_link, priority, estimated_time, due_offset_days, created, uuid) "
         "VALUES (:trigger_task, :follow_up_task, :catagory, :task_group, :subgroup, "
-        " :relevant_link, :priority, :estimated_time, :due_offset_days, :created)"
+        " :relevant_link, :priority, :estimated_time, :due_offset_days, :created, :uuid)"
     )
     with _ENGINE.begin() as conn:
         conn.execute(text("DELETE FROM follow_up_tasks"))
@@ -771,6 +864,7 @@ def save_follow_ups(df: pd.DataFrame) -> None:
                             if row.get("CREATED") is not None
                             else None
                         ),
+                        "uuid": _uuid_or_new(row.get("UUID")),
                     }
                 )
             conn.execute(insert_sql, params)
