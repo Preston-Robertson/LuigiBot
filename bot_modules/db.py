@@ -224,19 +224,35 @@ def _column_exists(conn, table: str, column: str) -> bool:
     return row is not None
 
 
-def _migrate_to_v2(conn) -> None:
-    """Idempotent v1 -> v2 migration: add `uuid TEXT`, backfill, add unique index.
+class _MigrationBlocked(RuntimeError):
+    """Raised when a required schema migration can't be applied by the current DB user.
 
-    Owns the uuid indexes for both fresh (v0 -> v2) and legacy (v1 -> v2) paths
-    so DDL never tries to index a column that hasn't been ALTERed in yet. Safe
-    to run repeatedly. Backfill is done in Python for dialect uniformity and
-    runs BEFORE the unique index is created so legacy nulls don't collide.
+    Typical cause: bot user has DML privileges but not table ownership on Postgres,
+    so ALTER TABLE / CREATE INDEX are refused. The operator (table owner) must run
+    ``scripts/migrate_v1_to_v2.sql`` once, then restart the bot.
     """
-    # 1. Add the column where missing.
-    for table in _UUID_TABLES:
-        if not _column_exists(conn, table, "uuid"):
+
+
+def _migrate_to_v2(conn, *, allow_ddl: bool) -> None:
+    """Idempotent v1 -> v2 migration: add ``uuid TEXT``, backfill, add unique index.
+
+    Split into three phases so the DML-only case (bot user without table ownership
+    on Postgres) fails fast with a clear message instead of a bare ``must be owner``.
+    Safe to run repeatedly. Backfill runs BEFORE the unique index is created so any
+    legacy nulls are gone first.
+    """
+    # 1. DDL: add missing columns. Requires ownership on Postgres.
+    missing = [t for t in _UUID_TABLES if not _column_exists(conn, t, "uuid")]
+    if missing:
+        if not allow_ddl:
+            raise _MigrationBlocked(
+                "uuid column missing on: " + ", ".join(missing)
+                + ". Bot DB user is not the table owner and cannot ALTER. "
+                "Run scripts/migrate_v1_to_v2.sql as the table owner, then restart."
+            )
+        for table in missing:
             conn.execute(text(f"ALTER TABLE {table} ADD COLUMN uuid TEXT"))
-    # 2. Backfill NULL uuids row-by-row (dialect-uniform).
+    # 2. Backfill NULL uuids (DML — always allowed).
     for table in _UUID_TABLES:
         null_rows = conn.execute(
             text(f"SELECT id FROM {table} WHERE uuid IS NULL")
@@ -246,11 +262,12 @@ def _migrate_to_v2(conn) -> None:
                 text(f"UPDATE {table} SET uuid = :u WHERE id = :i"),
                 {"u": str(_uuid.uuid4()), "i": r.id},
             )
-    # 3. Ensure the unique index exists (no-op if DDL already created it).
-    for table in _UUID_TABLES:
-        conn.execute(
-            text(f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{table}_uuid ON {table}(uuid)")
-        )
+    # 3. DDL: unique indexes. Requires ownership on Postgres.
+    if allow_ddl:
+        for table in _UUID_TABLES:
+            conn.execute(
+                text(f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{table}_uuid ON {table}(uuid)")
+            )
 
 
 def init_db() -> None:
@@ -267,11 +284,12 @@ def init_db() -> None:
                 exist_ok=True,
             )
         with _ENGINE.begin() as conn:
-            # On Postgres, CREATE INDEX (even IF NOT EXISTS) requires table
-            # ownership. When the schema is pre-provisioned by a different
-            # role (limited DML-only bot user), skip DDL entirely.
+            # On Postgres, ALTER / CREATE INDEX require table ownership. When the
+            # schema is pre-provisioned by a different role (limited DML-only bot
+            # user), skip all DDL. Use search-path-aware to_regclass('tasks') so
+            # this works whether tables live in `public` or a bot-specific schema.
             skip_ddl = _IS_POSTGRES and conn.execute(
-                text("SELECT to_regclass('public.tasks')")
+                text("SELECT to_regclass('tasks')")
             ).scalar() is not None
             if not skip_ddl:
                 for stmt in _ddl_statements():
@@ -281,8 +299,7 @@ def init_db() -> None:
             ).first()
             current_version = int(existing.version) if existing is not None else 0
             if current_version < SCHEMA_VERSION:
-                # Run migration (safe on fresh DBs too — becomes a no-op there).
-                _migrate_to_v2(conn)
+                _migrate_to_v2(conn, allow_ddl=not skip_ddl)
                 if existing is None:
                     conn.execute(
                         text("INSERT INTO schema_version (version) VALUES (:v)"),
