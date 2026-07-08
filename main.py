@@ -262,11 +262,25 @@ async def send_daily_message():
         active_df = to_do_list_df[to_do_list_df["STATUS"] != "Completed"]
         completed_df = to_do_list_df[to_do_list_df["STATUS"] == "Completed"]
 
+        today_local = datetime.datetime.now().date()
         for _, row in recurring_pd.iterrows():
             task_name = row["TASK"]
             if task_name not in active_df["TASK"].values:
                 latest = completed_df[completed_df["TASK"] == task_name]["COMPLETED TIME"].max()
-                if pd.isna(latest) or datetime.datetime.now() - latest >= pd.Timedelta(days=int(row["RECURRING INTERVAL"])):
+                # Never completed -> reactivate immediately (preserves prior
+                # behavior). Otherwise defer to the shared weekday-aware helper
+                # that mirrors luigi-web: RECURRING DAYS wins over RECURRING
+                # INTERVAL when both are set.
+                if pd.isna(latest):
+                    should_reactivate = True
+                else:
+                    next_date = db.next_reactivation(
+                        latest,
+                        row.get("RECURRING DAYS"),
+                        row.get("RECURRING INTERVAL"),
+                    )
+                    should_reactivate = next_date is not None and today_local >= next_date
+                if should_reactivate:
                     new_task = row.copy()
                     new_task["TASK CREATION"] = pd.to_datetime(datetime.datetime.now().isoformat(' ', 'seconds'))
                     new_task["STATUS"] = "Not Started"

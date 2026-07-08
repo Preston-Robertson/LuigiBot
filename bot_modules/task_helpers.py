@@ -25,6 +25,7 @@ def build_tracker_row(
     relevant_link=None,
     recurring=False,
     recurring_interval=None,
+    recurring_days=None,
     due_date=None,
     priority=1,
     estimated_time=None,
@@ -39,6 +40,9 @@ def build_tracker_row(
             "RELEVANT LINK": relevant_link,
             "RECURRING": recurring,
             "RECURRING INTERVAL": recurring_interval,
+            # Optional weekday-specific recurrence CSV (Mon=0..Sun=6). When set
+            # it takes precedence over RECURRING INTERVAL at reactivation time.
+            "RECURRING DAYS": recurring_days,
             "DUE DATE": pd.to_datetime(due_date),
             "PRIORITY": priority,
             "STATUS": pd.Categorical(

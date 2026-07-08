@@ -29,6 +29,7 @@ from __future__ import annotations
 import os
 import threading
 import uuid as _uuid
+from datetime import date, timedelta
 from typing import Iterable, Optional
 
 import pandas as pd
@@ -135,6 +136,7 @@ def _ddl_statements() -> list[str]:
             completed_time     TEXT,
             recurring          INTEGER DEFAULT 0,
             recurring_interval INTEGER,
+            recurring_days     TEXT,
             uuid               TEXT
         )
         """,
@@ -159,6 +161,7 @@ def _ddl_statements() -> list[str]:
             completed_time     TEXT,
             recurring          INTEGER DEFAULT 1,
             recurring_interval INTEGER,
+            recurring_days     TEXT,
             uuid               TEXT
         )
         """,
@@ -270,6 +273,22 @@ def _migrate_to_v2(conn, *, allow_ddl: bool) -> None:
             )
 
 
+def _ensure_recurring_days_columns(conn, *, allow_ddl: bool) -> None:
+    """Add the optional ``recurring_days TEXT`` column on the two task tables.
+
+    Ships from luigi-web (weekday recurrence). Idempotent. Non-fatal when the
+    bot lacks ownership on Postgres: reads tolerate the missing column (``SELECT
+    *`` + backfill None) and writes skip it via ``_tasks_sql_cols``. Unlike v2's
+    uuid migration this doesn't bump ``schema_version`` — the column lives
+    outside the versioned schema per the hand-off spec.
+    """
+    if not allow_ddl:
+        return
+    for table in ("tasks", "recurring_tasks"):
+        if not _column_exists(conn, table, "recurring_days"):
+            conn.execute(text(f"ALTER TABLE {table} ADD COLUMN recurring_days TEXT"))
+
+
 def init_db() -> None:
     """Create the DB (and parent dirs for SQLite) and all tables if missing. Idempotent."""
     global _INITIALIZED
@@ -310,6 +329,8 @@ def init_db() -> None:
                         text("UPDATE schema_version SET version = :v"),
                         {"v": SCHEMA_VERSION},
                     )
+            # Unversioned add-on from luigi-web; safe on every startup.
+            _ensure_recurring_days_columns(conn, allow_ddl=not skip_ddl)
         _INITIALIZED = True
 
 
@@ -334,6 +355,7 @@ _TASKS_SQL_TO_DF = {
     "completed_time": "COMPLETED TIME",
     "recurring": "RECURRING",
     "recurring_interval": "RECURRING INTERVAL",
+    "recurring_days": "RECURRING DAYS",
     "uuid": "UUID",
 }
 _TASKS_DF_TO_SQL = {v: k for k, v in _TASKS_SQL_TO_DF.items()}
@@ -399,6 +421,7 @@ TASK_DF_COLUMNS = [
     "RELEVANT LINK",
     "RECURRING",
     "RECURRING INTERVAL",
+    "RECURRING DAYS",
     "DUE DATE",
     "PRIORITY",
     "STATUS",
@@ -491,6 +514,84 @@ def _uuid_or_new(value) -> str:
     return s if s else str(_uuid.uuid4())
 
 
+# --- Weekday recurrence (luigi-web `recurring_days` column) -----------------
+
+def parse_recurring_days(raw) -> list[int]:
+    """Parse the stored CSV back into a sorted, deduped list of weekday ints.
+
+    Mirrors luigi-web's canonicalization (Mon=0 … Sun=6). Silently drops
+    anything outside 0..6 or otherwise malformed so a corrupted payload can't
+    crash the reactivation loop. Accepts ``None`` / ``NaN`` / non-strings and
+    returns ``[]``.
+    """
+    if raw is None:
+        return []
+    try:
+        if pd.isna(raw):
+            return []
+    except (TypeError, ValueError):
+        pass
+    if not isinstance(raw, str):
+        return []
+    seen: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            n = int(part)
+        except ValueError:
+            continue
+        if 0 <= n <= 6:
+            seen.add(n)
+    return sorted(seen)
+
+
+def _canonicalize_recurring_days(raw) -> Optional[str]:
+    """Return the canonical CSV form (e.g. ``"0,2,4"``) or ``None`` if empty."""
+    days = parse_recurring_days(raw)
+    return ",".join(str(d) for d in days) if days else None
+
+
+def next_reactivation(completed_time, recurring_days, recurring_interval) -> Optional[date]:
+    """Return the next `date` a completed recurring row should reactivate on.
+
+    Mirrors luigi-web's ``db.reactivation_date``. Weekday scheduling wins over
+    interval when both are set — that's deliberate. Returns ``None`` when the
+    row has no usable schedule (no completion, unparseable date, or neither
+    field configured).
+    """
+    if completed_time is None:
+        return None
+    try:
+        if pd.isna(completed_time):
+            return None
+    except (TypeError, ValueError):
+        pass
+    try:
+        base = date.fromisoformat(str(completed_time)[:10])
+    except ValueError:
+        return None
+
+    days = parse_recurring_days(recurring_days)
+    if days:
+        # "Strictly after" — delta starts at 1 so completing on a selected
+        # weekday still pushes to the *next* occurrence, not the same day.
+        for delta in range(1, 8):
+            candidate = base + timedelta(days=delta)
+            if candidate.weekday() in days:
+                return candidate
+        return None  # unreachable when `days` is non-empty
+
+    try:
+        n = int(recurring_interval) if recurring_interval is not None else 0
+    except (TypeError, ValueError):
+        return None
+    if n > 0:
+        return base + timedelta(days=n)
+    return None
+
+
 def _tasks_row_to_sql_params(row: pd.Series, sql_columns: Iterable[str]) -> dict:
     """Convert a task-shaped Series -> dict keyed by SQL column names."""
     out: dict = {}
@@ -499,6 +600,10 @@ def _tasks_row_to_sql_params(row: pd.Series, sql_columns: Iterable[str]) -> dict
         value = row.get(df_col)
         if sql_col == "uuid":
             out[sql_col] = _uuid_or_new(value)
+        elif sql_col == "recurring_days":
+            # Canonicalize on write so any junk from callers is normalized
+            # to the same CSV form luigi-web writes.
+            out[sql_col] = _canonicalize_recurring_days(value)
         elif df_col in _TASKS_BOOL_COLUMNS:
             out[sql_col] = _to_bool_int(value)
         elif df_col in _TASKS_INT_COLUMNS:
@@ -534,6 +639,26 @@ def _empty_follow_up_df() -> pd.DataFrame:
 # --- Tasks -------------------------------------------------------------------
 
 _TASKS_SQL_COLS = list(_TASKS_SQL_TO_DF.keys())
+_TASKS_WRITE_COLS_CACHE: dict[str, list[str]] = {}
+
+
+def _tasks_write_cols(table_name: str) -> list[str]:
+    """SQL column list to use for INSERT into a task-shaped table.
+
+    Drops ``recurring_days`` when the DB predates that column (only possible
+    on a locked-down Postgres where the bot can't ALTER TABLE). Cached per
+    table to keep the write hot path cheap; the column set can't change while
+    the bot is running.
+    """
+    cached = _TASKS_WRITE_COLS_CACHE.get(table_name)
+    if cached is not None:
+        return cached
+    cols = list(_TASKS_SQL_COLS)
+    with _ENGINE.connect() as conn:
+        if not _column_exists(conn, table_name, "recurring_days"):
+            cols = [c for c in cols if c != "recurring_days"]
+    _TASKS_WRITE_COLS_CACHE[table_name] = cols
+    return cols
 
 
 def _read_task_table(table_name: str) -> pd.DataFrame:
@@ -572,7 +697,7 @@ def _write_task_table(table_name: str, df: pd.DataFrame) -> None:
     reads. Surrogate `id`s are not stable across saves (same as SQLite).
     """
     init_db()
-    cols = _TASKS_SQL_COLS
+    cols = _tasks_write_cols(table_name)
     col_list = ", ".join(cols)
     placeholders = ", ".join(f":{c}" for c in cols)
     insert_sql = text(f"INSERT INTO {table_name} ({col_list}) VALUES ({placeholders})")
